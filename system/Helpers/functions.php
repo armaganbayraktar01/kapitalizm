@@ -49,3 +49,29 @@ if (!function_exists('admin_check')) {
         }
     }
 }
+
+//setting helper
+// Projenin herhangi bir yerinde (view dosyalarında veya controller'larda) get_setting('site_title') diyerek veritabanındaki ayarı anında okuyabilmek için system/Helpers/functions.php dosyasına şu fonksiyonu ekleyelim:
+
+if (!function_exists('get_setting')) {
+    function get_setting(string $key, $default = '') {
+        // Performans için veritabanına sürekli gitmemek adına static önbellekleme (Cache) yapabiliriz
+        static $settings = null;
+        
+        if ($settings === null) {
+            try {
+                $db = \System\Core\Database::getInstance();
+                $stmt = $db->query("SELECT setting_key, setting_value FROM settings");
+                $rows = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+                $settings = [];
+                foreach ($rows as $row) {
+                    $settings[$row['setting_key']] = $row['setting_value'];
+                }
+            } catch (\Exception $e) {
+                $settings = [];
+            }
+        }
+
+        return $settings[$key] ?? $default;
+    }
+}
