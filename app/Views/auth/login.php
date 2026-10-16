@@ -8,7 +8,7 @@
 <body class="bg-light d-flex align-items-center py-5" style="height: 100vh;">
     <div class="container">
         <div class="row justify-content-center">
-            <div class="col-md-4">
+            <div class="col-md-6">
                 <div class="card shadow-sm">
                     <div class="card-body p-4">
                         <h3 class="text-center mb-4">Giriş Yap</h3>

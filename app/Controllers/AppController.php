@@ -3,7 +3,7 @@ namespace App\Controllers;
 
 use System\Core\Controller;
 
-class HomeController extends Controller {
+class AppController extends Controller {
     public function index($param = null) {
         // Görünüme gönderilecek veriler
         $data = [
@@ -12,6 +12,6 @@ class HomeController extends Controller {
         ];
 
         // View çağrısı
-        $this->view('home/index', $data);
+        $this->view('app/index', $data);
     }
 }

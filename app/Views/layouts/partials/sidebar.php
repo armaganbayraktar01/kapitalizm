@@ -1,6 +1,8 @@
 <nav id="sidebar" class="p-3 text-white d-none d-md-block">
-    <div class="text-center py-3 mb-3 border-bottom border-secondary">
-        <h4 class="m-0 fw-bold text-primary">ManagerPanel</h4>
+    <div class="text-center py-2 mb-1 border-bottom border-secondary">
+        <a class="navbar-brand fw-bold" href="<?= base_url('app/index') ?>">
+            <i class="fas fa-cubes me-0 fw-bold text-primary"></i> <?= get_setting('site_title') ?> </br> Admin Paneli
+        </a>
     </div>
     <ul class="nav flex-column">
         <?php 

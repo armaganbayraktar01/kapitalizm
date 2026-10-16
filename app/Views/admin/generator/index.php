@@ -25,30 +25,30 @@
                         </tr>
                     </thead>
                     <tbody id="sortable-menu">
-                        <?php if (!empty($menus)): ?>
-                            <?php foreach ($menus as $menu): ?>
-                                <tr id="menu-<?= $menu['id'] ?>" class="align-middle" style="cursor: grab;">
+                        <?php if (!empty($modules)): ?>
+                            <?php foreach ($modules as $mod): ?>
+                                <tr id="menu-<?= $mod['id'] ?>" class="align-middle" style="cursor: grab;">
                                     <td class="px-4 text-muted">
                                         <i class="fas fa-bars handle" style="cursor: grab; padding: 10px;"></i>
                                     </td>
                                     <td>
                                         <span class="fw-semibold text-dark">
-                                            <i class="<?= htmlspecialchars($menu['icon'] ?? 'fas fa-folder') ?> me-2 text-primary"></i> 
-                                            <?= htmlspecialchars($menu['title']) ?>
+                                            <i class="<?= htmlspecialchars($mod['icon'] ?? 'fas fa-folder') ?> me-2 text-primary"></i> 
+                                            <?= htmlspecialchars($mod['title']) ?>
                                         </span>
                                     </td>
                                     <td>
-                                        <code class="text-primary bg-light px-2 py-1 rounded"><?= htmlspecialchars($menu['url']) ?></code>
+                                        <code class="text-primary bg-light px-2 py-1 rounded"><?= htmlspecialchars($mod['url']) ?></code>
                                     </td>
                                     <td>
-                                        <span class="text-muted small"><?= htmlspecialchars($menu['icon'] ?? '-') ?></span>
+                                        <span class="text-muted small"><?= htmlspecialchars($mod['icon'] ?? '-') ?></span>
                                     </td>
                                     <td class="text-end px-4">
                                         <div class="btn-group" role="group">
-                                            <a href="<?= base_url('admin/modules/edit/' . $menu['id']) ?>" class="btn btn-sm btn-outline-warning" title="Modülü Düzenle">
+                                            <a href="<?= base_url('admin/modules/edit/' . $mod['id']) ?>" class="btn btn-sm btn-outline-warning" title="Modülü Düzenle">
                                                 <i class="fas fa-edit"></i>
                                             </a>
-                                            <a href="<?= base_url('admin/modules/delete/' . $menu['id']) ?>" class="btn btn-sm btn-outline-danger" title="Modülü Kaldır" onclick="return confirm('Bu modülü silmek istediğinize emin misiniz?');">
+                                            <a href="<?= base_url('admin/modules/delete/' . $mod['id']) ?>" class="btn btn-sm btn-outline-danger" title="Modülü Kaldır" onclick="return confirm('Bu modülü silmek istediğinize emin misiniz?');">
                                                 <i class="fas fa-trash-alt"></i>
                                             </a>
                                         </div>
