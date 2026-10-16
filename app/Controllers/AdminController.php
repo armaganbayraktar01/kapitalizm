@@ -7,7 +7,6 @@ use System\Core\Database;
 class AdminController extends Controller {
 
     public function __construct() {
-        // Bu Controller içerisindeki tüm metodlara girmeden önce admin yetkisi kontrol edilir!
         admin_check();
     }
 
@@ -23,7 +22,6 @@ class AdminController extends Controller {
     // MENÜ YÖNETİMİ
     // ==========================================
 
-    // Menü Yönetim Sayfası ve Listeleme
     public function menus() {
         $menuModel = $this->model('Menu');
         $menus = $menuModel->getAll();
@@ -36,7 +34,6 @@ class AdminController extends Controller {
         $this->adminView('admin/menus/index', $data);
     }
 
-    // Yeni Menü Ekleme Sayfası ve Kayıt İşlemi
     public function menuCreate() {
         $menuModel = $this->model('Menu');
 
@@ -52,7 +49,6 @@ class AdminController extends Controller {
         $this->adminView('admin/menus/create', $data);
     }
 
-    // Menü Düzenleme
     public function menuEdit($id) {
         $menuModel = $this->model('Menu');
         $menu = $menuModel->find($id);
@@ -74,21 +70,18 @@ class AdminController extends Controller {
         $this->adminView('admin/menus/edit', $data);
     }
 
-    // Menü Silme
     public function menuDelete($id) {
         $menuModel = $this->model('Menu');
         $menuModel->delete($id);
         redirect('admin/menus');
     }
 
-    // AJAX ile Menü Sıralamasını Güncelleme
     public function menuSort() {
         if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['order'])) {
             $menuModel = $this->model('Menu');
-            $order = $_POST['order']; // Sıralı ID dizisi
+            $order = $_POST['order'];
 
             foreach ($order as $index => $menuId) {
-                // Menu modeline bu metodun ekli olduğundan emin olun
                 if (method_exists($menuModel, 'updateOrder')) {
                     $menuModel->updateOrder((int)$menuId, $index + 1);
                 }
@@ -100,10 +93,9 @@ class AdminController extends Controller {
     }
 
     // ==========================================
-    // SAYFA YÖNETİMİ & SİHİRBAZ
+    // SAYFA YÖNETİMİ
     // ==========================================
 
-    // Sayfaları Listeleme
     public function pages() {
         $pageModel = $this->model('Page');
         $pages = $pageModel->getAll();
@@ -116,67 +108,14 @@ class AdminController extends Controller {
         $this->adminView('admin/pages/index', $data);
     }
 
-    // Yeni Sayfa Ekleme ve Otomatik Controller Üretici (Sihirbaz)
     public function pageCreate() {
-        $menuModel = $this->model('Menu');
         $pageModel = $this->model('Page');
 
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-            $slug = trim($_POST['slug'], '/');
-            $title = $_POST['title'];
-            $pageType = $_POST['page_type'];
-            $icon = !empty($_POST['menu_icon']) ? $_POST['menu_icon'] : 'fas fa-file-alt';
-            $addToMenu = isset($_POST['add_to_menu']);
-            $menuId = null;
-
-            // 1. EĞER SAYFA TİPİ 'controller' İSE SİHİRBAZ ÇALIŞSIN VE DOSYAYI ÜRETSİN
-            if ($pageType === 'controller' && !empty($_POST['controller_name'])) {
-                $controllerName = trim($_POST['controller_name']);
-                $actionName = !empty($_POST['action_name']) ? trim($_POST['action_name']) : 'index';
-                
-                $controllerFilePath = __DIR__ . '/' . $controllerName . '.php';
-                
-                if (!file_exists($controllerFilePath)) {
-                    $controllerTemplate = "<?php\n" .
-                        "namespace App\Controllers;\n\n" .
-                        "use System\Core\Controller;\n\n" .
-                        "class " . $controllerName . " extends Controller {\n\n" .
-                        "    public function " . $actionName . "() {\n" .
-                        "        \$data = [\n" .
-                        "            'title' => '" . $title . "'\n" .
-                        "        ];\n\n" .
-                        "        echo '<div class=\"container mt-4\"><h3>" . $title . " Modülü</h3><p>Bu controller sihirbaz tarafından otomatik üretildi.</p></div>';\n" .
-                        "    }\n" .
-                        "}\n";
-
-                    file_put_contents($controllerFilePath, $controllerTemplate);
-                }
-            }
-
-            // 2. OTOMATİK MENÜ EKLEME MANTIĞI
-            if ($addToMenu) {
-                $allMenus = $menuModel->getAll();
-                $maxOrder = !empty($allMenus) ? max(array_column($allMenus, 'menu_order')) + 1 : 1;
-
-                $menuData = [
-                    'title' => $title,
-                    'url' => $slug,
-                    'icon' => $icon,
-                    'menu_order' => $maxOrder,
-                    'status' => isset($_POST['status']) ? 1 : 0,
-                    'target' => '_self'
-                ];
-                
-                $menuModel->create($menuData);
-                $db = Database::getInstance();
-                $menuId = $db->lastInsertId();
-            }
-
-            // 3. SAYFAYI KAYDET
-            $_POST['menu_id'] = $menuId;
+            $slug = trim($_POST['slug'] ?? '', '/');
             $_POST['slug'] = $slug;
+            
             $pageModel->create($_POST);
-
             redirect('admin/pages');
         }
 
@@ -187,69 +126,28 @@ class AdminController extends Controller {
         $this->adminView('admin/pages/create', $data);
     }
 
-    // Sayfa Düzenleme (Menü Senkronizasyonu ile)
     public function pageEdit($id) {
         $pageModel = $this->model('Page');
-        $menuModel = $this->model('Menu');
-        
         $page = $pageModel->find($id);
+
         if (!$page) {
             redirect('admin/pages');
         }
 
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-            $slug = trim($_POST['slug'], '/');
-            $title = $_POST['title'];
-            $_POST['slug'] = $slug;
-
-            // 1. Menü Senkronizasyonu
-            if (!empty($page['menu_id'])) {
-                $db = Database::getInstance();
-                $stmt = $db->prepare("UPDATE menus SET title = :title, url = :url WHERE id = :id");
-                $stmt->execute([
-                    'title' => $title,
-                    'url'   => $slug,
-                    'id'    => $page['menu_id']
-                ]);
-            }
-
-            // 2. Controller Sihirbazı Kontrolü
-            if ($_POST['page_type'] === 'controller' && !empty($_POST['controller_name'])) {
-                $controllerName = trim($_POST['controller_name']);
-                $actionName = !empty($_POST['action_name']) ? trim($_POST['action_name']) : 'index';
-                $controllerFilePath = __DIR__ . '/' . $controllerName . '.php';
-                
-                if (!file_exists($controllerFilePath)) {
-                    $controllerTemplate = "<?php\n" .
-                        "namespace App\Controllers;\n\n" .
-                        "use System\Core\Controller;\n\n" .
-                        "class " . $controllerName . " extends Controller {\n\n" .
-                        "    public function " . $actionName . "() {\n" .
-                        "        \$data = [\n" .
-                        "            'title' => '" . $title . "'\n" .
-                        "        ];\n\n" .
-                        "        echo '<div class=\"container mt-4\"><h3>" . $title . " Modülü</h3><p>Bu controller otomatik üretildi.</p></div>';\n" .
-                        "    }\n" .
-                        "}\n";
-                    file_put_contents($controllerFilePath, $controllerTemplate);
-                }
-            }
-
-            // 3. Sayfayı Güncelle
+            $_POST['slug'] = trim($_POST['slug'] ?? '', '/');
             $pageModel->update($id, $_POST);
             redirect('admin/pages');
         }
 
         $data = [
             'title' => 'Sayfayı Düzenle',
-            'page' => $page,
-            'menus' => $menuModel->getAll()
+            'page' => $page
         ];
 
         $this->adminView('admin/pages/edit', $data);
     }
 
-    // Sayfa Silme
     public function pageDelete($id) {
         $pageModel = $this->model('Page');
         $pageModel->delete($id);

@@ -75,3 +75,33 @@ if (!function_exists('get_setting')) {
         return $settings[$key] ?? $default;
     }
 }
+
+if (!function_exists('render_menu_tree')) {
+    function render_menu_tree($menus) {
+        foreach ($menus as $menu) {
+            $hasChildren = !empty($menu['children']);
+            $url = !empty($menu['url']) ? base_url($menu['url']) : '#';
+            $target = htmlspecialchars($menu['target'] ?? '_self');
+            $icon = htmlspecialchars($menu['icon'] ?? 'fas fa-file-alt');
+            $title = htmlspecialchars($menu['title']);
+
+            if ($hasChildren) {
+                echo '<li class="nav-item mb-1">';
+                echo '<a href="#submenu_' . $menu['id'] . '" data-bs-toggle="collapse" class="nav-link text-white d-flex justify-content-between align-items-center">';
+                echo '<span><i class="' . $icon . ' me-2"></i> ' . $title . '</span>';
+                echo '<i class="fas fa-angle-down small"></i>';
+                echo '</a>';
+                echo '<ul class="collapse list-unstyled ps-3 pb-1" id="submenu_' . $menu['id'] . '">';
+                render_menu_tree($menu['children']);
+                echo '</ul>';
+                echo '</li>';
+            } else {
+                echo '<li class="nav-item mb-1">';
+                echo '<a href="' . $url . '" target="' . $target . '" class="nav-link text-white ps-3">';
+                echo '<i class="' . $icon . ' me-2"></i> ' . $title;
+                echo '</a>';
+                echo '</li>';
+            }
+        }
+    }
+}

@@ -8,7 +8,7 @@ class HomeController extends Controller {
         // Görünüme gönderilecek veriler
         $data = [
             'title' => 'Ana Sayfa',
-            'message' => 'MVC yapısı başarıyla çalışıyor ve View yüklendi!'
+            'message' => 'xxx'
         ];
 
         // View çağrısı
