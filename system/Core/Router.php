@@ -4,7 +4,7 @@ namespace System\Core;
 use App\Models\Page;
 
 class Router {
-    protected $controller = 'HomeController'; 
+    protected $controller = 'AppController'; 
     protected string $method = 'index';            
     protected array $params = [];                
 
@@ -71,7 +71,7 @@ class Router {
                         }
                     }
 
-                    $this->controller = 'HomeController';
+                    $this->controller = 'AppController';
                     $this->method = 'index';
                     $this->params = $url;
                     $this->dispatch();
