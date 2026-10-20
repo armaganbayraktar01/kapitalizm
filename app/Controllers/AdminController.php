@@ -7,7 +7,7 @@ use System\Core\Database;
 class AdminController extends Controller {
 
     public function __construct() {
-        admin_check();
+        //admin_check();
     }
 
     // Admin Panel Ana Sayfası / Dashboard

@@ -67,6 +67,15 @@ class Module extends Model {
         return $this->buildTree($modules);
     }
 
+    // Sadece Oyuncu (App) Paneli İçin Aktif Hiyerarşik Menüleri Getirir
+    public function getAppHierarchicalMenus() {
+        $db = $this->db();
+        $stmt = $db->query("SELECT * FROM {$this->table} WHERE status = 1 AND (url LIKE 'app/%') ORDER BY menu_order ASC");
+        $modules = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+        
+        return $this->buildTree($modules);
+    }
+
     // Düz diziyi hiyerarşik ağaca dönüştüren yardımcı metot
     private function buildTree(array $elements, $parentId = null) {
         $branch = [];

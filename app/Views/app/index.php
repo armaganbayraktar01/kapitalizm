@@ -13,7 +13,7 @@
                 <h1 class="text-primary mb-3">Manager Projesi</h1>
                 <p class="lead"><?= $message ?></p>
                 <hr>
-                <span class="badge bg-success">MVC + Autoloader Aktif</span>
+                <span class="badge bg-success">MVC</span>
             </div>
         </div>
     </div>
