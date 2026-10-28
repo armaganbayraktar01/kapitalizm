@@ -6,10 +6,9 @@ use System\Core\Database;
 
 class PlayerBuildingController extends Controller {
 
-public function index() {
+    public function index() {
         $db = Database::getInstance();
         $userId = $_SESSION['user_id'] ?? $_SESSION['id'] ?? 1;
-
         $activeCategory = $_GET['category'] ?? 'Tesis ve Fabrika';
 
         $timeStmt = $db->query("SELECT UNIX_TIMESTAMP(NOW()) as db_now");
@@ -19,39 +18,47 @@ public function index() {
         $playerStmt = $db->prepare("SELECT * FROM users WHERE id = ?");
         $playerStmt->execute([$userId]);
         $player = $playerStmt->fetch(\PDO::FETCH_ASSOC);
-
         if (!isset($player['warehouse_level'])) $player['warehouse_level'] = 1;
 
+        // Arka plandaki ara depo ve otomatik üretim motoru tetiklenir
         $this->processProductionCycles($db, $userId, $now);
 
+        // Güncel oyuncu verilerini tekrar al
         $playerStmt->execute([$userId]);
         $player = $playerStmt->fetch(\PDO::FETCH_ASSOC);
+
         $warehouseLevel = (int)($player['warehouse_level'] ?? 1);
         $productSlotLimit = $warehouseLevel * 500.00;
-
         $nextWarehouseLevel = $warehouseLevel + 1;
+
         $matrixStmt = $db->prepare("SELECT * FROM warehouse_level_matrix WHERE level = ?");
         $matrixStmt->execute([$nextWarehouseLevel]);
         $nextWarehouseMeta = $matrixStmt->fetch(\PDO::FETCH_ASSOC);
         $warehouseUpgradeCost = $nextWarehouseMeta ? (float)$nextWarehouseMeta['upgrade_cost'] : ($warehouseLevel * 10000);
 
+        $researches = $this->getPlayerResearches($db, $userId);
+
         $query = "SELECT pb.*, pb.id as building_id, 
                          UNIX_TIMESTAMP(pb.phase_started_at) as phase_started_ts,
                          UNIX_TIMESTAMP(pb.paused_at) as paused_ts,
                          UNIX_TIMESTAMP(pb.created_at) as created_ts,
-                         bt.id as building_type_id, bt.name as building_name, bt.category, bt.complexity_type, 
-                         bt.energy_consumption, bt.water_consumption, bt.labor_required, 
-                         bt.base_cost, bt.production_rate, bt.unit_type, bt.image as building_image, 
-                         bt.produces_product_id, bt.consumes_product_id, bt.consumption_amount,
-                         p.name as product_name, p.image as product_image, p.unit_cost as product_base_cost,
-                         cp.name as input_product_name,
-                         prov.name as province_name, prov.population, prov.labor_cost_multiplier,
-                         prov.agri_multiplier, prov.ind_multiplier, prov.mine_multiplier, prov.latitude, prov.longitude
+                         bt.id as building_type_id, bt.name as building_name,
+                         bt.category, bt.complexity_type,
+                         bt.base_cost, bt.unit_type, bt.image as building_image,
+                         bt.produces_product_id,
+                         p.name as product_name, p.unit_type as unit_type, p.image as product_image,
+                         p.unit_cost as product_base_cost,
+                         prov.name as province_name, prov.population,
+                         prov.labor_cost_multiplier, prov.agri_multiplier, prov.ind_multiplier,
+                         prov.mine_multiplier, prov.latitude, prov.longitude,
+                         mlb.wear_rate, mlb.water_consumption, mlb.labor_required,
+                         mlb.base_tax_rate, mlb.production_rate, mlb.energy_consumption,
+                         mlb.base_labor_cost, mlb.base_transport_cost
                   FROM user_buildings pb
                   JOIN building_types bt ON pb.building_type_id = bt.id
                   LEFT JOIN products p ON bt.produces_product_id = p.id
-                  LEFT JOIN products cp ON bt.consumes_product_id = cp.id
                   JOIN provinces prov ON pb.province_id = prov.id
+                  LEFT JOIN matrix_level_building mlb ON mlb.building_type_id = pb.building_type_id AND mlb.level = pb.level
                   WHERE pb.user_id = ?
                   ORDER BY pb.id DESC";
 
@@ -59,56 +66,100 @@ public function index() {
         $stmt->execute([$userId]);
         $rawBuildings = $stmt->fetchAll(\PDO::FETCH_ASSOC);
 
-        $invStmt = $db->prepare("SELECT product_id, quantity FROM user_inventories WHERE user_id = ?");
+        $invStmt = $db->prepare("SELECT product_id, quantity, unit_cost FROM user_inventories WHERE user_id = ?");
         $invStmt->execute([$userId]);
         $inventoryMap = [];
+        $inventoryCostMap = [];
         foreach ($invStmt->fetchAll(\PDO::FETCH_ASSOC) as $invRow) {
             $inventoryMap[$invRow['product_id']] = (float)$invRow['quantity'];
+            $inventoryCostMap[$invRow['product_id']] = (float)($invRow['unit_cost'] ?? 0);
         }
 
+        $energyProdStmt = $db->prepare("SELECT id FROM products WHERE name LIKE '%Enerji%' OR name LIKE '%Elektrik%' LIMIT 1");
+        $energyProdStmt->execute();
+        $energyProductId = $energyProdStmt->fetchColumn() ?: 0;
+        $currentEnergyStock = $inventoryMap[$energyProductId] ?? 0.0;
+
         $my_buildings = [];
-        $playerMoney = (float)($player['money'] ?? 0);
+        $productionSec = 600;
 
         foreach ($rawBuildings as $b) {
-            $category = strtolower(trim($b['category']));
-            $regionMult = 1.0;
+            $category = strtolower(trim($b['category'] ?? ''));
+            $soilMultiplier = 1.0;
 
             if (str_contains($category, 'agri') || str_contains($category, 'tarım') || str_contains($category, 'bahçe')) {
-                $regionMult = (float)($b['agri_multiplier'] ?? 1.0);
-            } elseif (str_contains($category, 'ind') || str_contains($category, 'sanayi')) {
-                $regionMult = (float)($b['ind_multiplier'] ?? 1.0);
+                $soilMultiplier = (float)($b['agri_multiplier'] ?? 1.0);
+                $soilMultiplier *= (1.0 + (($researches['rBio'] - 1) * 0.02));
+            } elseif (str_contains($category, 'ind') || str_contains($category, 'sanayi') || str_contains($category, 'factory')) {
+                $soilMultiplier = (float)($b['ind_multiplier'] ?? 1.0);
             } elseif (str_contains($category, 'mine') || str_contains($category, 'maden')) {
-                $regionMult = (float)($b['mine_multiplier'] ?? 1.0);
+                $soilMultiplier = (float)($b['mine_multiplier'] ?? 1.0);
             }
-            if ($regionMult <= 0) $regionMult = 1.0;
+            if ($soilMultiplier <= 0) $soilMultiplier = 1.0;
 
             $level = (int)($b['level'] ?? 1);
-            $baseProd = (int)($b['production_rate'] ?? 8);
-            
-            try {
-                $matrixStmt = $db->prepare("SELECT production_rate FROM building_level_matrix WHERE building_type_id = ? AND level = ?");
-                $matrixStmt->execute([$b['building_type_id'], $level]);
-                $matrixRow = $matrixStmt->fetch(\PDO::FETCH_ASSOC);
-                if ($matrixRow && isset($matrixRow['production_rate'])) {
-                    $baseProd = (int)$matrixRow['production_rate'];
-                }
-            } catch (\Exception $e) {}
-
+            $productionRate = (float)($b['production_rate'] ?? 1.0);
             $health = (float)($b['condition_health'] ?? 100.0);
             $healthFactor = max(0, $health / 100.0);
-            $productionAmount = round($baseProd * $regionMult * $healthFactor, 2);
-            $unitLabel = $b['unit_type'] ?? 'Adet';
 
-            $unitCost = (float)($b['product_base_cost'] ?? 0);
-            $totalProductionCost = round($productionAmount * $unitCost, 2);
+            $outputs = $this->getBuildingOutputs($db, $b['building_type_id']);
+            $baseOutputAmount = !empty($outputs) ? (float)$outputs[0]['amount'] : 1.0;
+
+            $rndProdBonus = 1.0 + (($researches['rInd'] - 1) * 0.03) + (($researches['rTech'] - 1) * 0.02);
+            $productionAmount = round($baseOutputAmount * $productionRate * $soilMultiplier * $healthFactor * $rndProdBonus, 2);
+            if ($health < 50.0) $productionAmount = 0.0;
+
+            $unitLabel = $b['unit_type'] ?? 'Adet';
+            $rawInputs = $this->getBuildingInputs($db, $b['building_type_id']);
+            $inputs = [];
+            $inputMaterialCost = 0;
+
+            foreach ($rawInputs as $inp) {
+                $scaledInputAmount = round($inp['required_amount'] * $productionRate, 2);
+                $mCost = $inventoryCostMap[$inp['product_id']] ?? 0;
+                if ($mCost <= 0) {
+                    $matCostStmt = $db->prepare("SELECT unit_cost FROM products WHERE id = ?");
+                    $matCostStmt->execute([$inp['product_id']]);
+                    $mCost = (float)($matCostStmt->fetchColumn() ?? 0);
+                }
+                $rowCost = round($mCost * $scaledInputAmount, 2);
+                $inputMaterialCost += $rowCost;
+
+                $inputs[] = [
+                    'product_id' => $inp['product_id'],
+                    'product_name' => $inp['product_name'],
+                    'product_image' => $inp['product_image'],
+                    'unit_type' => $inp['unit_type'],
+                    'amount' => $scaledInputAmount,
+                    'unit_cost' => $mCost,
+                    'total_cost' => $rowCost
+                ];
+            }
+
+            $energyRequired = (float)($b['energy_consumption'] ?? 50);
+            $laborReq = (float)($b['labor_required'] ?? 10);
+            $baseLaborCost = (float)($b['base_labor_cost'] ?? 50.0);
+            $laborMult = (float)($b['labor_cost_multiplier'] ?? 1.0);
+            $baseTransport = (float)($b['base_transport_cost'] ?? 20.0);
+            $baseTax = (float)($b['base_tax_rate'] ?? 10.0);
+
+            $logDiscount = max(0.5, 1.0 - (($researches['rLog'] - 1) * 0.05));
+            $finDiscount = max(0.6, 1.0 - (($researches['rFin'] - 1) * 0.04));
+
+            $totalLaborExpense = round($laborReq * $baseLaborCost * $laborMult, 2);
+            $nakliyeCost = round($baseTransport * $logDiscount, 2);
+            $vergiCost = round($baseTax * $finDiscount, 2);
+
+            $totalProductionCost = round($inputMaterialCost + $totalLaborExpense + $nakliyeCost + $vergiCost, 2);
+            $cashDeductionCost = round($totalLaborExpense + $nakliyeCost + $vergiCost, 2);
+            $calculatedUnitCost = $productionAmount > 0 ? round($totalProductionCost / $productionAmount, 2) : 0;
 
             $phaseStartedTs = (int)($b['phase_started_ts'] ?? 0);
-            if ($phaseStartedTs <= 0) $phaseStartedTs = (int)($b['created_ts'] ?? $now);
-            
+            if ($phaseStartedTs <= 0) $phaseStartedTs = $now;
+
             $pausedTs = (int)($b['paused_ts'] ?? 0);
             $isPaused = (int)($b['is_paused'] ?? 0) === 1;
 
-            // Eğer tesis duraklatılmışsa, geçen süre paused_ts anında dondurulur
             if ($isPaused && $pausedTs > 0) {
                 $elapsedTime = $pausedTs - $phaseStartedTs;
             } else {
@@ -117,76 +168,94 @@ public function index() {
 
             $producesId = $b['produces_product_id'];
             $currentProductStock = $inventoryMap[$producesId] ?? 0.0;
-            
-            $hasInput = !empty($b['consumes_product_id']) && (float)($b['consumption_amount'] ?? 0) > 0;
-            $availableStock = $hasInput ? ($inventoryMap[$b['consumes_product_id']] ?? 0.0) : 0;
-            $requiredAmount = $hasInput ? (float)$b['consumption_amount'] : 0;
-            $hasEnoughInput = !$hasInput || ($availableStock >= $requiredAmount);
-
-            $status = $b['production_status'] ?? 'waiting_for_input';
-            $warningMessage = '';
             $isProductSlotFull = ($currentProductStock + $productionAmount) > $productSlotLimit;
 
-            if ($health < 50.0) {
-                $warningMessage = "Kritik Hasar! Sağlık %50 altında, üretim durdu.";
-            } elseif ($isProductSlotFull) {
-                $warningMessage = "Depo Dolu! Bu ürün için slot sınırı aşıldı.";
-            } elseif ($hasInput && $status === 'waiting_for_input' && !$hasEnoughInput) {
-                $warningMessage = "Hammadde Bekleniyor: {$b['input_product_name']} (Gereken: {$requiredAmount}, Mevcut: {$availableStock})";
+            $hasInput = !empty($inputs);
+            $bufferData = !empty($b['buffer_inventory']) ? json_decode($b['buffer_inventory'], true) : [];
+            $hasEnoughInput = true;
+            $missingInputsList = [];
+
+            // Ara depoda hammadde kilitliyse tesis üretimi sürdürüyor kabul edilir
+            $isCurrentlyProducing = !empty($bufferData);
+
+            if (!$isCurrentlyProducing && $hasInput) {
+                foreach ($inputs as $input) {
+                    $stock = $inventoryMap[$input['product_id']] ?? 0.0;
+                    if ($stock < $input['amount']) {
+                        $hasEnoughInput = false;
+                        $missingInputsList[] = "{$input['product_name']} (Gereken: {$input['amount']}, Mevcut: {$stock})";
+                    }
+                }
             }
 
-            // Arayüz Görsel Hesaplamaları
-            $transferSec = 15;
-            $productionSec = 600;
+            $hasEnoughEnergy = ($currentEnergyStock >= $energyRequired);
+            $warningMessage = '';
 
-            if (!$hasInput) {
-                // Girdisiz Tesis (Tarla)
-                if ($elapsedTime < 0) $elapsedTime = 0;
-                if ($elapsedTime > $productionSec) $elapsedTime = $productionSec;
-                $progress = ($elapsedTime / $productionSec) * 100;
-                $barText = $isPaused ? "DURAKLATILDI" : "Üretim İlerlemesi";
-                $barColor = $isPaused ? "bg-warning" : "bg-success progress-bar-animated progress-bar-striped";
-                $remSec = max(0, $productionSec - $elapsedTime);
-            } else {
-                // Girdili Tesis (Değirmen vb.)
-                if ($status === 'waiting_for_input') {
-                    $progress = 0;
-                    $remSec = 0;
-                    $barText = "Hammadde Bekleniyor...";
-                    $barColor = "bg-danger";
-                } elseif ($status === 'transferring') {
-                    if ($elapsedTime < 0) $elapsedTime = 0;
-                    if ($elapsedTime > $transferSec) $elapsedTime = $transferSec;
-                    $progress = ($elapsedTime / $transferSec) * 100;
-                    $barText = $isPaused ? "DURAKLATILDI (Transfer)" : "Hammadde Depodan Çekiliyor...";
-                    $barColor = $isPaused ? "bg-warning" : "bg-info progress-bar-animated progress-bar-striped";
-                    $remSec = max(0, $transferSec - $elapsedTime);
-                } else { // producing
-                    if ($elapsedTime < 0) $elapsedTime = 0;
-                    if ($elapsedTime > $productionSec) $elapsedTime = $productionSec;
-                    $progress = ($elapsedTime / $productionSec) * 100;
-                    $barText = $isPaused ? "DURAKLATILDI (Üretim)" : "Üretim İlerlemesi";
-                    $barColor = $isPaused ? "bg-warning" : "bg-success progress-bar-animated progress-bar-striped";
-                    $remSec = max(0, $productionSec - $elapsedTime);
+            if ($health < 50.0) {
+                $warningMessage = "Kritik Kondisyon! Sağlık %50 altına düştüğü için üretim durduruldu.";
+            } elseif ($isProductSlotFull) {
+                $warningMessage = "Depo Dolu! Bu ürün için slot sınırı aşıldı.";
+            } elseif (!$hasEnoughEnergy) {
+                $warningMessage = "Yetersiz Enerji! Depoda gereken {$energyRequired} kwh enerji yok.";
+            } elseif ($hasInput && !$hasEnoughInput && !$isCurrentlyProducing) {
+                $warningMessage = "Hammadde Bekleniyor: " . implode(', ', $missingInputsList);
+            }
+
+            $cycleProgressTime = $elapsedTime % $productionSec;
+
+            if ($health < 50.0 || $isProductSlotFull || !$hasEnoughEnergy || ($hasInput && !$hasEnoughInput && !$isCurrentlyProducing)) {
+                $remSec = 0;
+                $progress = 0;
+                if ($health < 50.0) {
+                    $barText = "ÜRETİM DURDURULDU (BAKIM GEREKLİ)";
+                } elseif ($isProductSlotFull) {
+                    $barText = "ÜRETİM DURDURULDU (DEPO DOLU)";
+                } elseif (!$hasEnoughEnergy) {
+                    $barText = "ÜRETİM DURDURULDU (ENERJİ YOK)";
+                } else {
+                    $barText = "HAMMADDE BEKLENİYOR...";
                 }
+                $barColor = "bg-danger";
+            } elseif ($isPaused) {
+                $remSec = max(0, $productionSec - $cycleProgressTime);
+                $progress = (($productionSec - $remSec) / $productionSec) * 100;
+                $barText = "DURAKLATILDI";
+                $barColor = "bg-warning";
+            } else {
+                $remSec = max(0, $productionSec - $cycleProgressTime);
+                $progress = ($cycleProgressTime / $productionSec) * 100;
+                $barText = "Üretim Aktif";
+                $barColor = "bg-success progress-bar-animated progress-bar-striped";
             }
 
             $b['id'] = $b['building_id'];
             $b['formula_details'] = [
-                'base_production' => $baseProd,
-                'region_multiplier' => $regionMult,
-                'unit_label' => $unitLabel,
-                'has_enough_input' => $hasEnoughInput,
-                'available_stock' => $availableStock,
-                'production_cost' => $totalProductionCost,
-                'input_product_name' => $b['input_product_name'] ?? 'Hammadde Gerekmiyor',
-                'consumption_amount' => $requiredAmount,
+                'production_rate' => $productionRate,
+                'product_image' => $b['product_image'],
+                'unit_type' => $b['unit_type'],
+                'soil_multiplier' => $soilMultiplier,
                 'health_factor' => $healthFactor,
-                'warning_message' => $warningMessage
+                'base_output_amount' => $baseOutputAmount,
+                'unit_label' => $unitLabel,
+                'has_enough_input' => ($hasEnoughInput || $isCurrentlyProducing),
+                'inputs' => $inputs,
+                'unit_cost' => $calculatedUnitCost,
+                'production_cost' => $totalProductionCost,
+                'cash_deduction_cost' => $cashDeductionCost,
+                'warning_message' => $warningMessage,
+                'energy_consumption' => $energyRequired,
+                'labor_required' => (int)($b['labor_required'] ?? 10),
+                'wear_rate' => (float)($b['wear_rate'] ?? 2.0),
+                'total_labor_expense' => $totalLaborExpense,
+                'base_transport_cost' => $nakliyeCost,
+                'base_tax_rate' => $vergiCost,
+                'input_material_cost' => $inputMaterialCost,
+                'researches' => $researches
             ];
-
             $b['production_amount'] = $productionAmount;
             $b['repair_cost'] = round(((float)($b['base_cost'] ?? 1000) * $level) * ((100.0 - $health) / 100.0), 2);
+            if ($b['repair_cost'] < 100 && $health < 100) $b['repair_cost'] = 100;
+
             $b['is_paused'] = $isPaused;
             $b['condition_health'] = $health;
             $b['image'] = $b['building_image'];
@@ -194,9 +263,9 @@ public function index() {
             $b['progress'] = $progress;
             $b['bar_text'] = $barText;
             $b['bar_color'] = $barColor;
-            $b['cycle_seconds'] = ($status === 'transferring') ? 15 : 600;
-            $b['is_active_ready'] = (!$isPaused && $health >= 50.0 && !$isProductSlotFull && ($hasEnoughInput || !$hasInput));
+            $b['cycle_seconds'] = $productionSec;
 
+            // Loglar (Tüm log tiplerini ayrıştır)
             $logStmt = $db->prepare("SELECT bl.*, p.name as product_name FROM building_logs bl LEFT JOIN products p ON bl.product_id = p.id WHERE bl.building_id = ? ORDER BY bl.id DESC LIMIT 50");
             $logStmt->execute([$b['building_id']]);
             $allLogs = $logStmt->fetchAll(\PDO::FETCH_ASSOC) ?: [];
@@ -216,7 +285,11 @@ public function index() {
             $my_buildings[] = $b;
         }
 
-        $inventoryStmt = $db->prepare("SELECT inv.*, p.name as product_name FROM user_inventories inv JOIN products p ON inv.product_id = p.id WHERE inv.user_id = ?");
+
+
+
+        $inventoryStmt = $db->prepare("SELECT inv.*, p.name as product_name, p.type, p.unit_type, p.image FROM user_inventories inv JOIN products p ON inv.product_id = p.id WHERE inv.user_id = ?");
+        //$inventoryStmt = $db->prepare("SELECT inv.*, p.name as product_name, p.type FROM user_inventories inv JOIN products p ON inv.product_id = p.id WHERE inv.user_id = ?");
         $inventoryStmt->execute([$userId]);
         $inventory = $inventoryStmt->fetchAll(\PDO::FETCH_ASSOC) ?: [];
 
@@ -247,227 +320,638 @@ public function index() {
 
     private function processProductionCycles($db, $userId, $now) {
         $productionSeconds = 600;
-        $transferSeconds = 15;
 
-        $playerRow = $db->prepare("SELECT warehouse_level FROM users WHERE id = ?");
+        $playerRow = $db->prepare("SELECT warehouse_level, money FROM users WHERE id = ?");
         $playerRow->execute([$userId]);
-        $warehouseLevel = (int)($playerRow->fetchColumn() ?? 1);
+        $playerRowData = $playerRow->fetch(\PDO::FETCH_ASSOC);
+        $warehouseLevel = (int)($playerRowData['warehouse_level'] ?? 1);
         $productSlotLimit = $warehouseLevel * 500.00;
+
+        $researches = $this->getPlayerResearches($db, $userId);
+
+        $energyProdStmt = $db->prepare("SELECT id FROM products WHERE name LIKE '%Enerji%' OR name LIKE '%Elektrik%' LIMIT 1");
+        $energyProdStmt->execute();
+        $energyProductId = $energyProdStmt->fetchColumn() ?: 0;
 
         $stmt = $db->prepare("SELECT pb.*, pb.id as building_id, 
                                      UNIX_TIMESTAMP(pb.phase_started_at) as phase_started_ts,
-                                     UNIX_TIMESTAMP(pb.created_at) as created_ts,
-                                     bt.id as building_type_id, bt.produces_product_id, bt.consumes_product_id, bt.consumption_amount, bt.production_rate, 
+                                     bt.produces_product_id, bt.category,
+                                     bt.id as building_type_id,
                                      p.name as product_name, p.unit_cost as product_base_cost,
-                                     cp.name as input_product_name,
-                                     prov.agri_multiplier, prov.ind_multiplier, prov.mine_multiplier, bt.category 
+                                     prov.mine_multiplier, prov.labor_cost_multiplier,
+                                     prov.agri_multiplier, prov.ind_multiplier,
+                                     mlb.production_rate, mlb.energy_consumption, mlb.wear_rate, mlb.labor_required, mlb.base_labor_cost,
+                                     mlb.base_transport_cost, mlb.base_tax_rate
                               FROM user_buildings pb 
                               JOIN building_types bt ON pb.building_type_id = bt.id 
                               LEFT JOIN products p ON bt.produces_product_id = p.id
-                              LEFT JOIN products cp ON bt.consumes_product_id = cp.id
                               JOIN provinces prov ON pb.province_id = prov.id 
+                              LEFT JOIN matrix_level_building mlb ON mlb.building_type_id = pb.building_type_id AND mlb.level = pb.level
                               WHERE pb.user_id = ?");
         $stmt->execute([$userId]);
         $buildings = $stmt->fetchAll(\PDO::FETCH_ASSOC);
 
         foreach ($buildings as $b) {
             if ((int)($b['is_paused'] ?? 0) === 1) continue;
-            if ((float)($b['condition_health'] ?? 100.0) < 50.0) continue;
 
+            $health = (float)($b['condition_health'] ?? 100.0);
             $bId = $b['building_id'];
-            $producesId = $b['produces_product_id'];
-            $consumesId = $b['consumes_product_id'];
-            $consumptionAmount = (float)($b['consumption_amount'] ?? 0);
-            $hasInput = !empty($consumesId) && $consumptionAmount > 0;
 
-            $status = $b['production_status'] ?? 'waiting_for_input';
-            $phaseStartedTs = (int)($b['phase_started_ts'] ?? 0);
-            if ($phaseStartedTs <= 0) $phaseStartedTs = $now;
-
-            $elapsed = $now - $phaseStartedTs;
-
-            // --- 1. GİRDİSİZ TESİSLER (Örn: Buğday Tarlası) ---
-            if (!$hasInput) {
-                if ($elapsed >= $productionSeconds) {
-                    try {
-                        $db->beginTransaction();
-                        
-                        $category = strtolower(trim($b['category']));
-                        $regionMult = 1.0;
-                        if (str_contains($category, 'agri') || str_contains($category, 'tarım')) $regionMult = (float)$b['agri_multiplier'];
-                        elseif (str_contains($category, 'ind') || str_contains($category, 'sanayi')) $regionMult = (float)$b['ind_multiplier'];
-                        elseif (str_contains($category, 'mine') || str_contains($category, 'maden')) $regionMult = (float)$b['mine_multiplier'];
-                        if ($regionMult <= 0) $regionMult = 1.0;
-
-                        $health = (float)($b['condition_health'] ?? 100.0);
-                        $healthFactor = max(0, $health / 100.0);
-                        $baseProd = (int)$b['production_rate'];
-
-                        try {
-                            $matrixStmt = $db->prepare("SELECT production_rate FROM building_level_matrix WHERE building_type_id = ? AND level = ?");
-                            $matrixStmt->execute([$b['building_type_id'], (int)$b['level']]);
-                            $matrixRow = $matrixStmt->fetch(\PDO::FETCH_ASSOC);
-                            if ($matrixRow && isset($matrixRow['production_rate'])) $baseProd = (int)$matrixRow['production_rate'];
-                        } catch (\Exception $e) {}
-
-                        $prodAmount = round($baseProd * $regionMult * $healthFactor, 2);
-
-                        $invCheck = $db->prepare("SELECT quantity FROM user_inventories WHERE user_id = ? AND product_id = ? FOR UPDATE");
-                        $invCheck->execute([$userId, $producesId]);
-                        $invRow = $invCheck->fetch(\PDO::FETCH_ASSOC);
-                        $currentStock = (float)($invRow['quantity'] ?? 0);
-
-                        if (($currentStock + $prodAmount) <= $productSlotLimit && $prodAmount > 0) {
-                            if ($invRow) {
-                                $db->prepare("UPDATE user_inventories SET quantity = quantity + ? WHERE user_id = ? AND product_id = ?")
-                                   ->execute([$prodAmount, $userId, $producesId]);
-                            } else {
-                                $db->prepare("INSERT INTO user_inventories (user_id, product_id, quantity) VALUES (?, ?, ?)")
-                                   ->execute([$userId, $producesId, $prodAmount]);
-                            }
-
-                            $logDesc = "Üretim tamamlandı: {$prodAmount} adet {$b['product_name']} merkez depoya kaydedildi.";
-                            $db->prepare("INSERT INTO building_logs (building_id, action_type, product_id, amount, description, created_at) VALUES (?, 'production', ?, ?, ?, NOW())")
-                               ->execute([$bId, $producesId, $prodAmount, $logDesc]);
-
-                            $newHealth = max(0.0, $health - 2.0);
-                            $db->prepare("UPDATE user_buildings SET condition_health = ? WHERE id = ?")->execute([$newHealth, $bId]);
-
-                            $db->prepare("UPDATE user_buildings SET phase_started_at = FROM_UNIXTIME(? + ?) WHERE id = ?")
-                               ->execute([$phaseStartedTs, $productionSeconds, $bId]);
-                        }
-                        $db->commit();
-                    } catch (\Exception $e) {
-                        if ($db->inTransaction()) $db->rollBack();
-                    }
-                }
+            // SÜSLÜ PARANTEZ DÜZELTİLDİ: Tesis sağlığı düşükse zamanı sıfırla ve sonrakine geç
+            if ($health < 50.0) {
+                $db->prepare("UPDATE user_buildings SET phase_started_at = NOW() WHERE id = ?")->execute([$bId]);
                 continue;
             }
 
-            // --- 2. GİRDİLİ TESİSLER (Örn: Değirmen) İKİ AŞAMALI MİMARİ ---
-            
-            if ($status === 'waiting_for_input') {
-                $chk = $db->prepare("SELECT quantity FROM user_inventories WHERE user_id = ? AND product_id = ?");
-                $chk->execute([$userId, $consumesId]);
-                $currentStock = (float)($chk->fetchColumn() ?? 0);
+            $producesId = $b['produces_product_id'];
+            $productionRate = (float)($b['production_rate'] ?? 1.0);
+            $energyRequired = (float)($b['energy_consumption'] ?? 50);
 
-                if ($currentStock >= $consumptionAmount) {
-                    $db->prepare("UPDATE user_buildings SET production_status = 'transferring', phase_started_at = NOW() WHERE id = ?")
-                       ->execute([$bId]);
+            $rawInputs = $this->getBuildingInputs($db, $b['building_type_id']);
+            $outputs = $this->getBuildingOutputs($db, $b['building_type_id']);
+            $baseOutputAmount = !empty($outputs) ? (float)$outputs[0]['amount'] : 1.0;
+
+            $phaseStartedTs = (int)($b['phase_started_ts'] ?? 0);
+            if ($phaseStartedTs <= 0) $phaseStartedTs = $now;
+            $elapsed = $now - $phaseStartedTs;
+
+            $bufferData = !empty($b['buffer_inventory']) ? json_decode($b['buffer_inventory'], true) : [];
+
+            // 1. ADIM: Ara depo (buffer) boşsa ve hammadde gerekiyorsa merkez depodan çek
+            if (empty($bufferData) && !empty($rawInputs)) {
+                $hasAllInputsNow = true;
+                $tempBuffer = [];
+                foreach ($rawInputs as $inp) {
+                    $scaledReq = round($inp['required_amount'] * $productionRate, 2);
+                    $chkStock = $db->prepare("SELECT quantity FROM user_inventories WHERE user_id = ? AND product_id = ?");
+                    $chkStock->execute([$userId, $inp['product_id']]);
+                    $stockVal = (float)$chkStock->fetchColumn();
+
+                    if ($stockVal < $scaledReq) {
+                        $hasAllInputsNow = false;
+                        break;
+                    }
+                    $tempBuffer[$inp['product_id']] = $scaledReq;
                 }
-            } 
-            elseif ($status === 'transferring') {
-                if ($elapsed >= $transferSeconds) {
-                    try {
-                        $db->beginTransaction();
 
-                        $chkStock = $db->prepare("SELECT quantity FROM user_inventories WHERE user_id = ? AND product_id = ? FOR UPDATE");
-                        $chkStock->execute([$userId, $consumesId]);
-                        $stockVal = (float)($chkStock->fetchColumn() ?? 0);
+                if (!$hasAllInputsNow) {
+                    $db->prepare("UPDATE user_buildings SET phase_started_at = NOW() WHERE id = ?")->execute([$bId]);
+                    continue;
+                }
 
-                        if ($stockVal < $consumptionAmount) {
-                            $db->prepare("UPDATE user_buildings SET production_status = 'waiting_for_input', phase_started_at = NOW() WHERE id = ?")
-                               ->execute([$bId]);
-                            $db->commit();
-                            continue;
+                foreach ($tempBuffer as $pId => $qty) {
+                    $db->prepare("UPDATE user_inventories SET quantity = quantity - ? WHERE user_id = ? AND product_id = ?")
+                       ->execute([$qty, $userId, $pId]);
+
+                    $prodNameStmt = $db->prepare("SELECT name, unit_type FROM products WHERE id = ?");
+                    $prodNameStmt->execute([$pId]);
+                    $prodData = $prodNameStmt->fetch(\PDO::FETCH_ASSOC);
+
+                    $inName = $prodData['name'] ?? 'Ürün';
+                    $unit_type = $prodData['unit_type'] ?? 'Adet';
+
+                    $consumeLog = "{$qty} {$unit_type} {$inName} tesis deposuna transfer edildi.";
+                    $db->prepare("INSERT INTO building_logs (building_id, action_type, product_id, amount, description, created_at) VALUES (?, 'consumption', ?, ?, ?, NOW())")
+                    ->execute([$bId, $pId, $qty, $consumeLog]);
+                }
+
+                $db->prepare("UPDATE user_buildings SET buffer_inventory = ?, phase_started_at = NOW() WHERE id = ?")
+                   ->execute([json_encode($tempBuffer), $bId]);
+
+                continue;
+            }
+
+            if (!empty($rawInputs) && empty($bufferData)) {
+                continue;
+            }
+
+            if ($elapsed <= 0) continue;
+            $completedCycles = floor($elapsed / $productionSeconds);
+            if ($completedCycles <= 0) continue;
+
+            $category = strtolower(trim($b['category'] ?? ''));
+            $soilMultiplier = 1.0;
+            if (str_contains($category, 'agri') || str_contains($category, 'tarım')) {
+                $soilMultiplier = (float)$b['agri_multiplier'] * (1.0 + (($researches['rBio'] - 1) * 0.02));
+            } elseif (str_contains($category, 'ind') || str_contains($category, 'sanayi') || str_contains($category, 'factory')) {
+                $soilMultiplier = (float)$b['ind_multiplier'] ?? 1.0;
+            } elseif (str_contains($category, 'mine') || str_contains($category, 'maden')) {
+                $soilMultiplier = (float)$b['mine_multiplier'] ?? 1.0;
+            }
+            if ($soilMultiplier <= 0) $soilMultiplier = 1.0;
+
+            $healthFactor = max(0, $health / 100.0);
+            $rndProdBonus = 1.0 + (($researches['rInd'] - 1) * 0.03) + (($researches['rTech'] - 1) * 0.02);
+            $prodAmountPerCycle = round($baseOutputAmount * $productionRate * $soilMultiplier * $healthFactor * $rndProdBonus, 2);
+
+            $laborReq = (float)($b['labor_required'] ?? 10);
+            $baseLaborCost = (float)($b['base_labor_cost'] ?? 50.0);
+            $laborMult = (float)($b['labor_cost_multiplier'] ?? 1.0);
+            $baseTransport = (float)($b['base_transport_cost'] ?? 20.0);
+            $baseTax = (float)($b['base_tax_rate'] ?? 10.0);
+
+            $logDiscount = max(0.5, 1.0 - (($researches['rLog'] - 1) * 0.05));
+            $finDiscount = max(0.6, 1.0 - (($researches['rFin'] - 1) * 0.04));
+            $cashCostPerCycle = round(($laborReq * $baseLaborCost * $laborMult) + ($baseTransport * $logDiscount) + ($baseTax * $finDiscount), 2);
+            $wearRatePerCycle = (float)($b['wear_rate'] ?? 2.0);
+
+            try {
+                $db->beginTransaction();
+                $processedCyclesCount = 0;
+
+                for ($i = 0; $i < $completedCycles; $i++) {
+                    $currentHealth = (float)$db->query("SELECT condition_health FROM user_buildings WHERE id = {$bId}")->fetchColumn();
+                    if ($currentHealth < 50.0) break;
+
+                    // Enerji Kontrolü
+                    if ($energyProductId > 0 && $energyRequired > 0) {
+                        $enLock = $db->prepare("SELECT quantity FROM user_inventories WHERE user_id = ? AND product_id = ? FOR UPDATE");
+                        $enLock->execute([$userId, $energyProductId]);
+                        $enStock = (float)$enLock->fetchColumn();
+                        if ($enStock < $energyRequired) break;
+
+                        $db->prepare("UPDATE user_inventories SET quantity = quantity - ? WHERE user_id = ? AND product_id = ?")
+                           ->execute([$energyRequired, $userId, $energyProductId]);
+
+                        $db->prepare("INSERT INTO building_logs (building_id, action_type, product_id, amount, description, created_at) VALUES (?, 'consumption', ?, ?, ?, NOW())")
+                           ->execute([$bId, $energyProductId, $energyRequired, "{$energyRequired} kw enerji tüketimi gerçekleşti."]);
+                    }
+
+                    // Depo Kapasite Kontrolü
+                    $invCheck = $db->prepare("SELECT quantity FROM user_inventories WHERE user_id = ? AND product_id = ? FOR UPDATE");
+                    $invCheck->execute([$userId, $producesId]);
+                    $currentStock = (float)($invCheck->fetchColumn() ?? 0);
+
+                    if (($currentStock + $prodAmountPerCycle) > $productSlotLimit) {
+                        break;
+                    }
+
+                    // Bütçe Kontrolü
+                    $playerMoney = (float)$db->query("SELECT money FROM users WHERE id = {$userId}")->fetchColumn();
+                    if ($cashCostPerCycle > 0 && $playerMoney < $cashCostPerCycle) break;
+
+                    // Maliyet Hesaplama
+                    $inputMaterialCost = 0;
+                    foreach ($rawInputs as $inp) {
+                        $scaledReq = round($inp['required_amount'] * $productionRate, 2);
+                        $itemCostQuery = $db->prepare("SELECT unit_cost FROM user_inventories WHERE user_id = ? AND product_id = ?");
+                        $itemCostQuery->execute([$userId, $inp['product_id']]);
+                        $itemCostRow = $itemCostQuery->fetch(\PDO::FETCH_ASSOC);
+                        $mCost = (float)($itemCostRow['unit_cost'] ?? 0);
+                        if ($mCost <= 0) {
+                            $pCostStmt = $db->prepare("SELECT unit_cost FROM products WHERE id = ?");
+                            $pCostStmt->execute([$inp['product_id']]);
+                            $mCost = (float)$pCostStmt->fetchColumn();
+                        }
+                        $inputMaterialCost += round($mCost * $scaledReq, 2);
+                    }
+
+                    $totalProductionCost = round($inputMaterialCost + $cashCostPerCycle, 2);
+                    $calculatedUnitCost = $prodAmountPerCycle > 0 ? round($totalProductionCost / $prodAmountPerCycle, 2) : 0;
+
+                    // Ürünü Envantere Ekle (Küsurat Hassasiyeti İle)
+                    $invRow = $db->prepare("SELECT quantity, unit_cost FROM user_inventories WHERE user_id = ? AND product_id = ?");
+                    $invRow->execute([$userId, $producesId]);
+                    $existingInv = $invRow->fetch(\PDO::FETCH_ASSOC);
+
+                    if ($existingInv) {
+                        $oldQty = (float)$existingInv['quantity'];
+                        $oldCost = (float)$existingInv['unit_cost'];
+                        $newTotalQty = round($oldQty + $prodAmountPerCycle, 2);
+                        $blendedUnitCost = $newTotalQty > 0 ? (($oldQty * $oldCost) + ($prodAmountPerCycle * $calculatedUnitCost)) / $newTotalQty : $calculatedUnitCost;
+
+                        $db->prepare("UPDATE user_inventories SET quantity = ?, unit_cost = ? WHERE user_id = ? AND product_id = ?")
+                           ->execute([$newTotalQty, round($blendedUnitCost, 2), $userId, $producesId]);
+                    } else {
+                        $db->prepare("INSERT INTO user_inventories (user_id, product_id, quantity, unit_cost) VALUES (?, ?, ?, ?)")
+                           ->execute([$userId, $producesId, $prodAmountPerCycle, $calculatedUnitCost]);
+                    }
+
+                    // Gider Düşümü
+                    if ($cashCostPerCycle > 0) {
+                        $db->prepare("UPDATE users SET money = money - ? WHERE id = ?")->execute([$cashCostPerCycle, $userId]);
+                        $costLog = "{$prodAmountPerCycle} {$b['unit_type']} {$b['product_name']} üretimi için {$cashCostPerCycle}₺ maliyet aktarıldı.";
+                        $db->prepare("INSERT INTO building_logs (building_id, action_type, product_id, amount, description, created_at) VALUES (?, 'cost', ?, ?, ?, NOW())")
+                           ->execute([$bId, $producesId, $cashCostPerCycle, $costLog]);
+                    }
+
+                    // BİNA SAĞLIĞI VE DÜZELTİLEN AŞINMA LOGU ('wear')
+                    $newHealth = max(0.0, round($currentHealth - $wearRatePerCycle, 2));
+                    $db->prepare("UPDATE user_buildings SET condition_health = ? WHERE id = ?")->execute([$newHealth, $bId]);
+                    
+                    $wearLogDesc = "Üretim döngüsü nedeniyle tesis %{$wearRatePerCycle} oranında aşındı. Yeni Kondisyon: %{$newHealth}";
+                    $db->prepare("INSERT INTO building_logs (building_id, action_type, product_id, amount, description, created_at) VALUES (?, 'wear', NULL, ?, ?, NOW())")
+                       ->execute([$bId, $wearRatePerCycle, $wearLogDesc]);
+
+                    // Üretim Logu
+                    $logDesc = "Üretim tamamlandı: {$prodAmountPerCycle} {$b['unit_type']} {$b['product_name']} depoya eklendi.";
+                    $db->prepare("INSERT INTO building_logs (building_id, action_type, product_id, amount, description, created_at) VALUES (?, 'production', ?, ?, ?, NOW())")
+                       ->execute([$bId, $producesId, $prodAmountPerCycle, $logDesc]);
+
+                    // Buffer Sıfırlama
+                    $db->prepare("UPDATE user_buildings SET buffer_inventory = NULL WHERE id = ?")->execute([$bId]);
+                    $bufferData = [];
+
+                    $processedCyclesCount++;
+                }
+
+                if ($processedCyclesCount > 0) {
+                    $advancedSeconds = $processedCyclesCount * $productionSeconds;
+                    $db->prepare("UPDATE user_buildings SET phase_started_at = DATE_ADD(phase_started_at, INTERVAL ? SECOND) WHERE id = ?")
+                       ->execute([$advancedSeconds, $bId]);
+                } else {
+                    $db->prepare("UPDATE user_buildings SET phase_started_at = NOW() WHERE id = ?")->execute([$bId]);
+                }
+
+                $db->commit();
+            } catch (\Exception $e) {
+                if ($db->inTransaction()) $db->rollBack();
+            }
+        }
+    }
+
+    public function finish() {
+        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+            $db = Database::getInstance();
+            $userId = $_SESSION['user_id'] ?? $_SESSION['id'] ?? 1;
+            $buildingId = (int)($_POST['building_id'] ?? 0);
+
+            $isAjax = !empty($_SERVER['HTTP_X_REQUESTED_WITH']) && strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) === 'xmlhttprequest';
+
+            // GÜNCELLENDİ: p.name (ürün adı) ve p.unit_type (birim türü) sorguya eklendi
+            $stmt = $db->prepare("SELECT pb.*, bt.produces_product_id, bt.category,
+                                         p.name as product_name, p.unit_type as product_unit_type,
+                                         prov.agri_multiplier, prov.ind_multiplier, prov.mine_multiplier, prov.labor_cost_multiplier,
+                                         mlb.production_rate, mlb.labor_required, mlb.base_labor_cost, mlb.base_transport_cost, mlb.base_tax_rate, mlb.wear_rate
+                                  FROM user_buildings pb 
+                                  JOIN building_types bt ON pb.building_type_id = bt.id 
+                                  LEFT JOIN products p ON bt.produces_product_id = p.id
+                                  JOIN provinces prov ON pb.province_id = prov.id 
+                                  LEFT JOIN matrix_level_building mlb ON mlb.building_type_id = pb.building_type_id AND mlb.level = pb.level
+                                  WHERE pb.id = ? AND pb.user_id = ?");
+            $stmt->execute([$buildingId, $userId]);
+            $b = $stmt->fetch(\PDO::FETCH_ASSOC);
+
+            if (!$b) {
+                if ($isAjax) { echo json_encode(['status' => 'error', 'message' => 'Tesis bulunamadı.']); exit; }
+                redirect('/app/playerbuilding');
+            }
+
+            try {
+                $db->beginTransaction();
+                $researches = $this->getPlayerResearches($db, $userId);
+
+                $category = strtolower(trim($b['category'] ?? ''));
+                $soilMultiplier = 1.0;
+                if (str_contains($category, 'agri') || str_contains($category, 'tarım')) {
+                    $soilMultiplier = (float)$b['agri_multiplier'] * (1.0 + (($researches['rBio'] - 1) * 0.02));
+                } elseif (str_contains($category, 'ind') || str_contains($category, 'sanayi') || str_contains($category, 'factory')) {
+                    $soilMultiplier = (float)$b['ind_multiplier'];
+                } elseif (str_contains($category, 'mine') || str_contains($category, 'maden')) {
+                    $soilMultiplier = (float)$b['mine_multiplier'];
+                }
+                if ($soilMultiplier <= 0) $soilMultiplier = 1.0;
+
+                $health = (float)($b['condition_health'] ?? 100.0);
+                if ($health < 50.0) throw new \Exception('Tesis sağlığı %50 altında, işlem yapılamaz!');
+
+                $healthFactor = max(0, $health / 100.0);
+                $productionRate = (float)$b['production_rate'];
+                $rndProdBonus = 1.0 + (($researches['rInd'] - 1) * 0.03) + (($researches['rTech'] - 1) * 0.02);
+
+                $outputs = $this->getBuildingOutputs($db, $b['building_type_id']);
+                $baseOutputAmount = !empty($outputs) ? (float)$outputs[0]['amount'] : 1.0;
+                $prodAmount = round($baseOutputAmount * $productionRate * $soilMultiplier * $healthFactor * $rndProdBonus, 2);
+
+                // Ürün adı ve birim türü değişkenleri
+                $productName = $b['product_name'] ?? 'Mamul';
+                $productUnit = $b['product_unit_type'] ?? 'Adet';
+
+                $laborReq = (float)$b['labor_required'];
+                $baseLaborCost = (float)$b['base_labor_cost'];
+                $laborMult = (float)$b['labor_cost_multiplier'];
+                $baseTransport = (float)$b['base_transport_cost'];
+                $baseTax = (float)$b['base_tax_rate'];
+
+                $rawInputs = $this->getBuildingInputs($db, $b['building_type_id']);
+                $inputMaterialCost = 0;
+                $bufferData = !empty($b['buffer_inventory']) ? json_decode($b['buffer_inventory'], true) : [];
+
+                foreach ($rawInputs as $input) {
+                    $scaledReq = round($input['required_amount'] * $productionRate, 2);
+
+                    if (!isset($bufferData[$input['product_id']]) || $bufferData[$input['product_id']] < $scaledReq) {
+                        $chk = $db->prepare("SELECT quantity, unit_cost FROM user_inventories WHERE user_id = ? AND product_id = ?");
+                        $chk->execute([$userId, $input['product_id']]);
+                        $invItem = $chk->fetch(\PDO::FETCH_ASSOC);
+                        $currentStock = (float)($invItem['quantity'] ?? 0);
+
+                        if ($currentStock < $scaledReq) {
+                            throw new \Exception('Yetersiz Hammadde! Depoda gerekli girdi bulunmuyor.');
                         }
 
                         $db->prepare("UPDATE user_inventories SET quantity = quantity - ? WHERE user_id = ? AND product_id = ?")
-                           ->execute([$consumptionAmount, $userId, $consumesId]);
-
-                        $consumeLog = "{$consumptionAmount} adet {$b['input_product_name']} depodan çekilerek işlendi.";
-                        $db->prepare("INSERT INTO building_logs (building_id, action_type, product_id, amount, description, created_at) VALUES (?, 'consumption', ?, ?, ?, NOW())")
-                           ->execute([$bId, $consumesId, $consumptionAmount, $consumeLog]);
-
-                        $db->prepare("UPDATE user_buildings SET production_status = 'producing', phase_started_at = NOW() WHERE id = ?")
-                           ->execute([$bId]);
-
-                        $db->commit();
-                    } catch (\Exception $e) {
-                        if ($db->inTransaction()) $db->rollBack();
+                           ->execute([$scaledReq, $userId, $input['product_id']]);
                     }
+
+                    $itemCostQuery = $db->prepare("SELECT unit_cost FROM user_inventories WHERE user_id = ? AND product_id = ?");
+                    $itemCostQuery->execute([$userId, $input['product_id']]);
+                    $invItemCost = $itemCostQuery->fetch(\PDO::FETCH_ASSOC);
+                    $itemCost = (float)($invItemCost['unit_cost'] ?? 0);
+
+                    if ($itemCost <= 0) {
+                        $pCostStmt = $db->prepare("SELECT unit_cost FROM products WHERE id = ?");
+                        $pCostStmt->execute([$input['product_id']]);
+                        $itemCost = (float)$pCostStmt->fetchColumn();
+                    }
+                    $inputMaterialCost += round($itemCost * $scaledReq, 2);
                 }
-            } 
-            elseif ($status === 'producing') {
-                if ($elapsed >= $productionSeconds) {
-                    try {
-                        $db->beginTransaction();
 
-                        $category = strtolower(trim($b['category']));
-                        $regionMult = 1.0;
-                        if (str_contains($category, 'agri') || str_contains($category, 'tarım')) $regionMult = (float)$b['agri_multiplier'];
-                        elseif (str_contains($category, 'ind') || str_contains($category, 'sanayi')) $regionMult = (float)$b['ind_multiplier'];
-                        elseif (str_contains($category, 'mine') || str_contains($category, 'maden')) $regionMult = (float)$b['mine_multiplier'];
-                        if ($regionMult <= 0) $regionMult = 1.0;
+                $logDiscount = max(0.5, 1.0 - (($researches['rLog'] - 1) * 0.05));
+                $finDiscount = max(0.6, 1.0 - (($researches['rFin'] - 1) * 0.04));
 
-                        $health = (float)($b['condition_health'] ?? 100.0);
-                        $healthFactor = max(0, $health / 100.0);
-                        $baseProd = (int)$b['production_rate'];
+                $totalLaborExpense = round($laborReq * $baseLaborCost * $laborMult, 2);
+                $nakliyeCost = round($baseTransport * $logDiscount, 2);
+                $vergiCost = round($baseTax * $finDiscount, 2);
 
-                        try {
-                            $matrixStmt = $db->prepare("SELECT production_rate FROM building_level_matrix WHERE building_type_id = ? AND level = ?");
-                            $matrixStmt->execute([$b['building_type_id'], (int)$b['level']]);
-                            $matrixRow = $matrixStmt->fetch(\PDO::FETCH_ASSOC);
-                            if ($matrixRow && isset($matrixRow['production_rate'])) $baseProd = (int)$matrixRow['production_rate'];
-                        } catch (\Exception $e) {}
+                $totalProductionCost = round($inputMaterialCost + $totalLaborExpense + $nakliyeCost + $vergiCost, 2);
+                $calculatedUnitCost = $prodAmount > 0 ? round($totalProductionCost / $prodAmount, 2) : 0;
 
-                        $prodAmount = round($baseProd * $regionMult * $healthFactor, 2);
-                        $unitCost = (float)($b['product_base_cost'] ?? 0);
-                        $totalProductionCost = round($prodAmount * $unitCost, 2);
+                $cashDeductionCost = round($totalLaborExpense + $nakliyeCost + $vergiCost, 2);
+                $finishCost = round($cashDeductionCost * 1.20, 2);
 
-                        $invCheck = $db->prepare("SELECT quantity FROM user_inventories WHERE user_id = ? AND product_id = ? FOR UPDATE");
-                        $invCheck->execute([$userId, $producesId]);
-                        $invRow = $invCheck->fetch(\PDO::FETCH_ASSOC);
-                        $currentProductStock = (float)($invRow['quantity'] ?? 0);
+                $playerMoney = (float)$db->query("SELECT money FROM users WHERE id = {$userId}")->fetchColumn();
+                if ($playerMoney < $finishCost) throw new \Exception('Yetersiz bütçe! Hızlı bitirme maliyeti karşılanamıyor.');
 
-                        if (($currentProductStock + $prodAmount) <= $productSlotLimit && $prodAmount > 0) {
-                            if ($invRow) {
-                                $db->prepare("UPDATE user_inventories SET quantity = quantity + ? WHERE user_id = ? AND product_id = ?")
-                                   ->execute([$prodAmount, $userId, $producesId]);
-                            } else {
-                                $db->prepare("INSERT INTO user_inventories (user_id, product_id, quantity) VALUES (?, ?, ?)")
-                                   ->execute([$userId, $producesId, $prodAmount]);
-                            }
+                $pInfo = $db->prepare("SELECT warehouse_level FROM users WHERE id = ?");
+                $pInfo->execute([$userId]);
+                $wLevel = (int)($pInfo->fetchColumn() ?? 1);
+                $slotLimit = $wLevel * 500.00;
 
-                            $logDesc = "Üretim tamamlandı: {$prodAmount} adet {$b['product_name']} merkez depoya kaydedildi.";
-                            $db->prepare("INSERT INTO building_logs (building_id, action_type, product_id, amount, description, created_at) VALUES (?, 'production', ?, ?, ?, NOW())")
-                               ->execute([$bId, $producesId, $prodAmount, $logDesc]);
+                $producesId = $b['produces_product_id'];
+                $invCheck = $db->prepare("SELECT quantity, unit_cost FROM user_inventories WHERE user_id = ? AND product_id = ?");
+                $invCheck->execute([$userId, $producesId]);
+                $invRow = $invCheck->fetch(\PDO::FETCH_ASSOC);
+                $currentStock = (float)($invRow['quantity'] ?? 0);
 
-                            $newHealth = max(0.0, $health - 2.0);
-                            $db->prepare("UPDATE user_buildings SET condition_health = ? WHERE id = ?")->execute([$newHealth, $bId]);
+                if (($currentStock + $prodAmount) > $slotLimit) {
+                    throw new \Exception('Depo Slot Kapasitesi Yetersiz!');
+                }
 
-                            $wearLogDesc = "Üretim döngüsü tamamlandı, tesis sağlığı %2 azalarak %{$newHealth} seviyesine düştü.";
-                            $db->prepare("INSERT INTO building_logs (building_id, action_type, product_id, amount, description, created_at) VALUES (?, 'wear', ?, 2.0, ?, NOW())")
-                               ->execute([$bId, $producesId, $wearLogDesc]);
+                if ($finishCost > 0) {
+                    $db->prepare("UPDATE users SET money = money - ? WHERE id = ?")->execute([$finishCost, $userId]);
+                    $costLog = "{$prodAmount} {$productUnit} {$productName} üretimi {$finishCost}₺ karşılığında tamamlandı.";
+                    $db->prepare("INSERT INTO building_logs (building_id, action_type, product_id, amount, description, created_at) VALUES (?, 'cost', ?, ?, ?, NOW())")
+                       ->execute([$buildingId, $producesId, $finishCost, $costLog]);
+                }
 
-                            $playerMoney = (float)$db->query("SELECT money FROM users WHERE id = {$userId}")->fetchColumn();
-                            if ($totalProductionCost > 0 && $playerMoney >= $totalProductionCost) {
-                                $db->prepare("UPDATE users SET money = money - ? WHERE id = ?")->execute([$totalProductionCost, $userId]);
-                                $costLog = "{$prodAmount} adet {$b['product_name']} üretimi için maliyet kesildi: {$totalProductionCost}₺.";
-                                $db->prepare("INSERT INTO building_logs (building_id, action_type, product_id, amount, description, created_at) VALUES (?, 'cost', ?, ?, ?, NOW())")
-                                   ->execute([$bId, $producesId, $totalProductionCost, $costLog]);
-                            }
+                if (!empty($producesId) && $prodAmount > 0) {
+                    if ($invRow) {
+                        $oldQty = (float)$invRow['quantity'];
+                        $oldCost = (float)$invRow['unit_cost'];
+                        $newTotalQty = round($oldQty + $prodAmount, 2);
+                        $blendedUnitCost = $newTotalQty > 0 ? (($oldQty * $oldCost) + ($prodAmount * $calculatedUnitCost)) / $newTotalQty : $calculatedUnitCost;
 
-                            $chkNext = $db->prepare("SELECT quantity FROM user_inventories WHERE user_id = ? AND product_id = ?");
-                            $chkNext->execute([$userId, $consumesId]);
-                            $nextStock = (float)($chkNext->fetchColumn() ?? 0);
-
-                            if ($nextStock >= $consumptionAmount) {
-                                $db->prepare("UPDATE user_buildings SET production_status = 'transferring', phase_started_at = NOW() WHERE id = ?")
-                                   ->execute([$bId]);
-                            } else {
-                                $db->prepare("UPDATE user_buildings SET production_status = 'waiting_for_input', phase_started_at = NOW() WHERE id = ?")
-                                   ->execute([$bId]);
-                            }
-                        }
-
-                        $db->commit();
-                    } catch (\Exception $e) {
-                        if ($db->inTransaction()) $db->rollBack();
+                        $db->prepare("UPDATE user_inventories SET quantity = ?, unit_cost = ? WHERE user_id = ? AND product_id = ?")
+                           ->execute([$newTotalQty, round($blendedUnitCost, 2), $userId, $producesId]);
+                    } else {
+                        $db->prepare("INSERT INTO user_inventories (user_id, product_id, quantity, unit_cost) VALUES (?, ?, ?, ?)")
+                           ->execute([$userId, $producesId, $prodAmount, $calculatedUnitCost]);
                     }
+
+                    // GÜNCELLENDİ: Log mesajı dinamik ürün adı ve birimle yazıldı
+                    $logDesc = "Üretim tamamlandı (Hızlı): {$prodAmount} {$productUnit} {$productName} depoya eklendi.";
+                    $db->prepare("INSERT INTO building_logs (building_id, action_type, product_id, amount, description, created_at) VALUES (?, 'production', ?, ?, ?, NOW())")
+                       ->execute([$buildingId, $producesId, $prodAmount, $logDesc]);
+                }
+
+                // Aşınma Hesabı ve Kaydı
+                $wearRatePerCycle = (float)($b['wear_rate'] ?? 2.0);
+                $newHealth = max(0.0, round($health - $wearRatePerCycle, 2));
+                $db->prepare("UPDATE user_buildings SET condition_health = ? WHERE id = ?")->execute([$newHealth, $buildingId]);
+
+                $wearLogDesc = "Hızlı üretim nedeniyle tesis %{$wearRatePerCycle} oranında aşındı. Yeni Kondisyon: %{$newHealth}";
+                $db->prepare("INSERT INTO building_logs (building_id, action_type, product_id, amount, description, created_at) VALUES (?, 'wear', NULL, ?, ?, NOW())")
+                   ->execute([$buildingId, $wearRatePerCycle, $wearLogDesc]);
+
+                // Sayaç Zamanını Sıfırla ve Buffer'ı Temizle
+                $db->prepare("UPDATE user_buildings SET phase_started_at = NOW(), buffer_inventory = NULL WHERE id = ?")->execute([$buildingId]);
+
+                $db->commit();
+
+                if ($isAjax) {
+                    header('Content-Type: application/json');
+                    echo json_encode(['status' => 'success', 'message' => 'Üretim başarıyla tamamlandı.']);
+                    exit;
+                }
+            } catch (\Exception $e) {
+                if ($db->inTransaction()) $db->rollBack();
+                if ($isAjax) {
+                    header('Content-Type: application/json');
+                    echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
+                    exit;
                 }
             }
+            redirect('/app/playerbuilding');
         }
+    }
+
+    public function getInventoryItemDetail() {
+        if ($_SERVER['REQUEST_METHOD'] === 'POST' || isset($_GET['product_id'])) {
+            $db = Database::getInstance();
+            $userId = $_SESSION['user_id'] ?? $_SESSION['id'] ?? 1;
+            $productId = (int)($_POST['product_id'] ?? $_GET['product_id'] ?? 0);
+
+            $invStmt = $db->prepare("SELECT inv.*, p.name as product_name, p.unit_cost as base_cost, p.type FROM user_inventories inv JOIN products p ON inv.product_id = p.id WHERE inv.user_id = ? AND inv.product_id = ?");
+            $invStmt->execute([$userId, $productId]);
+            $item = $invStmt->fetch(\PDO::FETCH_ASSOC);
+
+            if (!$item) {
+                echo json_encode(['status' => 'error', 'message' => 'Ürün bulunamadı.']);
+                exit;
+            }
+
+            $logStmt = $db->prepare("SELECT bl.*, b.id as b_id, bt.name as building_name 
+                                     FROM building_logs bl 
+                                     JOIN user_buildings b ON bl.building_id = b.id 
+                                     JOIN building_types bt ON b.building_type_id = bt.id 
+                                     WHERE b.user_id = ? AND bl.product_id = ? 
+                                     ORDER BY bl.id DESC LIMIT 25");
+            $logStmt->execute([$userId, $productId]);
+            $logs = $logStmt->fetchAll(\PDO::FETCH_ASSOC);
+
+            $costLogStmt = $db->prepare("SELECT bl.* FROM building_logs bl JOIN user_buildings b ON bl.building_id = b.id WHERE b.user_id = ? AND bl.product_id = ? AND (bl.action_type = 'cost' OR bl.action_type = 'repair') ORDER BY bl.id DESC LIMIT 10");
+            $costLogStmt->execute([$userId, $productId]);
+            $costLogs = $costLogStmt->fetchAll(\PDO::FETCH_ASSOC);
+
+            $energyLogStmt = $db->prepare("SELECT bl.* FROM building_logs bl JOIN user_buildings b ON bl.building_id = b.id WHERE b.user_id = ? AND bl.product_id = ? AND bl.action_type = 'consumption' ORDER BY bl.id DESC LIMIT 10");
+            $energyLogStmt->execute([$userId, $productId]);
+            $energyLogs = $energyLogStmt->fetchAll(\PDO::FETCH_ASSOC);
+
+            $ch1Labels = []; $ch1Prod = []; $ch1Cons = [];
+            foreach (array_reverse($logs) as $log) {
+                $ch1Labels[] = date('H:i:s', strtotime($log['created_at']));
+                if ($log['action_type'] === 'production') {
+                    $ch1Prod[] = (float)$log['amount'];
+                    $ch1Cons[] = 0;
+                } elseif ($log['action_type'] === 'consumption') {
+                    $ch1Prod[] = 0;
+                    $ch1Cons[] = (float)$log['amount'];
+                } else {
+                    $ch1Prod[] = 0;
+                    $ch1Cons[] = 0;
+                }
+            }
+
+            $ch2Labels = []; $ch2Data = [];
+            foreach (array_reverse($costLogs) as $clog) {
+                $ch2Labels[] = date('H:i:s', strtotime($clog['created_at']));
+                $ch2Data[] = (float)$clog['amount'];
+            }
+
+            $ch3Labels = []; $ch3Data = [];
+            foreach (array_reverse($energyLogs) as $elog) {
+                $ch3Labels[] = date('H:i:s', strtotime($elog['created_at']));
+                $ch3Data[] = (float)$elog['amount'];
+            }
+
+            echo json_encode([
+                'status' => 'success',
+                'item' => $item,
+                'logs' => $logs,
+                'charts' => [
+                    'prod_cons' => ['labels' => $ch1Labels, 'production' => $ch1Prod, 'consumption' => $ch1Cons],
+                    'cost' => ['labels' => $ch2Labels, 'data' => $ch2Data],
+                    'energy' => ['labels' => $ch3Labels, 'data' => $ch3Data]
+                ]
+            ]);
+            exit;
+        }
+    }
+
+    public function tradeInventoryItem() {
+        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+            $db = Database::getInstance();
+            $userId = $_SESSION['user_id'] ?? $_SESSION['id'] ?? 1;
+            $productId = (int)($_POST['product_id'] ?? 0);
+            $actionType = $_POST['action_type'] ?? '';
+            $amount = (float)($_POST['amount'] ?? 0);
+
+            if ($amount <= 0) {
+                echo json_encode(['status' => 'error', 'message' => 'Geçersiz miktar!']);
+                exit;
+            }
+
+            try {
+                $db->beginTransaction();
+                $pStmt = $db->prepare("SELECT unit_cost, name FROM products WHERE id = ?");
+                $pStmt->execute([$productId]);
+                $prod = $pStmt->fetch(\PDO::FETCH_ASSOC);
+                if (!$prod) throw new \Exception('Ürün bulunamadı.');
+
+                $basePrice = (float)($prod['unit_cost'] > 0 ? $prod['unit_cost'] : 10.00);
+
+                $uStmt = $db->prepare("SELECT money FROM users WHERE id = ? FOR UPDATE");
+                $uStmt->execute([$userId]);
+                $userMoney = (float)$uStmt->fetchColumn();
+
+                $iStmt = $db->prepare("SELECT quantity, unit_cost FROM user_inventories WHERE user_id = ? AND product_id = ? FOR UPDATE");
+                $iStmt->execute([$userId, $productId]);
+                $inv = $iStmt->fetch(\PDO::FETCH_ASSOC);
+                $currentStock = (float)($inv['quantity'] ?? 0);
+
+                if ($actionType === 'buy') {
+                    $totalCost = round($basePrice * $amount * 1.15, 2);
+                    if ($userMoney < $totalCost) throw new \Exception('Yetersiz bütçe!');
+
+                    $db->prepare("UPDATE users SET money = money - ? WHERE id = ?")->execute([$totalCost, $userId]);
+
+                    if ($inv) {
+                        $newQty = round($currentStock + $amount, 2);
+                        $newCost = round((($currentStock * (float)$inv['unit_cost']) + $totalCost) / $newQty, 2);
+                        $db->prepare("UPDATE user_inventories SET quantity = ?, unit_cost = ? WHERE user_id = ? AND product_id = ?")
+                           ->execute([$newQty, $newCost, $userId, $productId]);
+                    } else {
+                        $db->prepare("INSERT INTO user_inventories (user_id, product_id, quantity, unit_cost) VALUES (?, ?, ?, ?)")
+                           ->execute([$userId, $productId, $amount, round($basePrice * 1.15, 2)]);
+                    }
+                } elseif ($actionType === 'sell') {
+                    if ($currentStock < $amount) throw new \Exception('Depoda yeterli ürün yok!');
+
+                    $totalRevenue = round($basePrice * $amount * 0.85, 2);
+                    $db->prepare("UPDATE users SET money = money + ? WHERE id = ?")->execute([$totalRevenue, $userId]);
+
+                    $newQty = round($currentStock - $amount, 2);
+                    if ($newQty <= 0) {
+                        $db->prepare("DELETE FROM user_inventories WHERE user_id = ? AND product_id = ?")->execute([$userId, $productId]);
+                    } else {
+                        $db->prepare("UPDATE user_inventories SET quantity = ? WHERE user_id = ? AND product_id = ?")
+                           ->execute([$newQty, $userId, $productId]);
+                    }
+                } else {
+                    throw new \Exception('Geçersiz işlem tipi!');
+                }
+
+                $db->commit();
+                echo json_encode(['status' => 'success', 'message' => 'İşlem başarıyla gerçekleştirildi.']);
+                exit;
+            } catch (\Exception $e) {
+                if ($db->inTransaction()) $db->rollBack();
+                echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
+                exit;
+            }
+        }
+    }
+
+    private function getBuildingInputs($db, $buildingTypeId) {
+        $stmt = $db->prepare("SELECT bi.*, p.name as product_name, p.unit_type as unit_type, p.image as product_image FROM building_inputs bi JOIN products p ON bi.product_id = p.id WHERE bi.building_type_id = ?");
+        $stmt->execute([$buildingTypeId]);
+        $rows = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+        $inputs = [];
+        foreach ($rows as $row) {
+            $inputs[] = [
+                'product_id' => $row['product_id'],
+                'product_name' => $row['product_name'],
+                'unit_type' => $row['unit_type'],
+                'required_amount' => (float)$row['amount'],
+                'product_image' => $row['product_image'] ?? '' // Hammadde görseli
+            ];
+        }
+        return $inputs;
+    }
+
+    private function getBuildingOutputs($db, $buildingTypeId) {
+        // SQL sorgusuna p.unit_type ve p.image (ürün görseli) eklendi
+        $stmt = $db->prepare("SELECT bo.*, p.name as product_name, p.unit_type, p.image as product_image 
+                              FROM building_outputs bo 
+                              JOIN products p ON bo.product_id = p.id 
+                              WHERE bo.building_type_id = ?");
+        $stmt->execute([$buildingTypeId]);
+        $rows = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+        $outputs = [];
+        foreach ($rows as $row) {
+            $outputs[] = [
+                'product_id' => $row['product_id'],
+                'product_name' => $row['product_name'],
+                'unit_type' => $row['unit_type'] ?? 'Adet', // Veritabanından gelen dinamik birim
+                'amount' => (float)$row['amount'],
+                'product_image' => $row['product_image'] ?? '' // Ürün görseli
+            ];
+        }
+        return $outputs;
+    }
+
+    private function getPlayerResearches($db, $userId) {
+        $stmt = $db->prepare("SELECT * FROM user_researches WHERE user_id = ?");
+        $stmt->execute([$userId]);
+        $row = $stmt->fetch(\PDO::FETCH_ASSOC);
+        return [
+            'rBio' => (int)($row['bio_level'] ?? 1),
+            'rInd' => (int)($row['ind_level'] ?? 1),
+            'rTech' => (int)($row['tech_level'] ?? 1),
+            'rLog' => (int)($row['log_level'] ?? 1),
+            'rFin' => (int)($row['fin_level'] ?? 1),
+        ];
     }
 
     public function togglePause() {
@@ -475,6 +959,8 @@ public function index() {
             $db = Database::getInstance();
             $userId = $_SESSION['user_id'] ?? $_SESSION['id'] ?? 1;
             $buildingId = (int)($_POST['building_id'] ?? 0);
+            
+            $isAjax = !empty($_SERVER['HTTP_X_REQUESTED_WITH']) && strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) === 'xmlhttprequest';
 
             $stmt = $db->prepare("SELECT is_paused, paused_at FROM user_buildings WHERE id = ? AND user_id = ?");
             $stmt->execute([$buildingId, $userId]);
@@ -482,23 +968,17 @@ public function index() {
 
             if ($b) {
                 $isPaused = (int)$b['is_paused'];
-                
                 if ($isPaused === 1) {
-                    // PLAY (Devam Et): Molada geçen süreyi hesapla ve phase_started_at değerini o kadar ileri kaydır
-                    // Yeni Başlangıç = Eski Başlangıç + (Şu An - Duraklatıldığı An)
-                    $db->prepare("UPDATE user_buildings 
-                                  SET is_paused = 0, 
-                                      phase_started_at = DATE_ADD(phase_started_at, INTERVAL TIMESTAMPDIFF(SECOND, paused_at, NOW()) SECOND),
-                                      paused_at = NULL 
-                                  WHERE id = ?")
+                    $db->prepare("UPDATE user_buildings SET is_paused = 0, phase_started_at = DATE_ADD(phase_started_at, INTERVAL TIMESTAMPDIFF(SECOND, paused_at, NOW()) SECOND), paused_at = NULL WHERE id = ?")
                        ->execute([$buildingId]);
                 } else {
-                    // PAUSE (Duraklat): Duraklatıldığı anı (paused_at) veritabanına kaydet
-                    $db->prepare("UPDATE user_buildings 
-                                  SET is_paused = 1, 
-                                      paused_at = NOW() 
-                                  WHERE id = ?")
+                    $db->prepare("UPDATE user_buildings SET is_paused = 1, paused_at = NOW() WHERE id = ?")
                        ->execute([$buildingId]);
+                }
+
+                if ($isAjax) {
+                    echo json_encode(['status' => 'success']);
+                    exit;
                 }
             }
             redirect('/app/playerbuilding');
@@ -526,8 +1006,8 @@ public function index() {
                         try {
                             $db->beginTransaction();
                             $db->prepare("UPDATE users SET money = money - ? WHERE id = ?")->execute([$repairCost, $userId]);
-                            $db->prepare("UPDATE user_buildings SET condition_health = 100.00 WHERE id = ?")->execute([$buildingId]);
-                            
+                            $db->prepare("UPDATE user_buildings SET condition_health = 100.00, phase_started_at = NOW() WHERE id = ?")->execute([$buildingId]);
+
                             $repairLogDesc = "Tesis bakımı yapıldı, kondisyon %100'e çıkarıldı. Ödenen Tamirat Bedeli: {$repairCost}₺";
                             $db->prepare("INSERT INTO building_logs (building_id, action_type, product_id, amount, description, created_at) VALUES (?, 'repair', NULL, ?, ?, NOW())")
                                ->execute([$buildingId, $repairCost, $repairLogDesc]);
@@ -547,7 +1027,6 @@ public function index() {
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $db = Database::getInstance();
             $userId = $_SESSION['user_id'] ?? $_SESSION['id'] ?? 1;
-
             $player = $db->prepare("SELECT money, warehouse_level FROM users WHERE id = ?");
             $player->execute([$userId]);
             $p = $player->fetch(\PDO::FETCH_ASSOC);
@@ -559,7 +1038,6 @@ public function index() {
                 $meta = $db->prepare("SELECT * FROM warehouse_level_matrix WHERE level = ?");
                 $meta->execute([$nextLevel]);
                 $metaRow = $meta->fetch(\PDO::FETCH_ASSOC);
-
                 $upgradeCost = $metaRow ? (float)$metaRow['upgrade_cost'] : ($currentLevel * 10000);
 
                 if ((float)$p['money'] >= $upgradeCost) {
@@ -577,122 +1055,10 @@ public function index() {
         }
     }
 
-    public function finish() {
-        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-            $db = Database::getInstance();
-            $userId = $_SESSION['user_id'] ?? $_SESSION['id'] ?? 1;
-            $buildingId = (int)($_POST['building_id'] ?? 0);
-
-            $stmt = $db->prepare("SELECT pb.*, bt.produces_product_id, bt.consumes_product_id, bt.consumption_amount, bt.production_rate, 
-                                         p.name as product_name, p.unit_cost as product_base_cost,
-                                         cp.name as input_product_name,
-                                         prov.agri_multiplier, prov.ind_multiplier, prov.mine_multiplier, bt.category 
-                                  FROM user_buildings pb 
-                                  JOIN building_types bt ON pb.building_type_id = bt.id 
-                                  LEFT JOIN products p ON bt.produces_product_id = p.id
-                                  LEFT JOIN products cp ON bt.consumes_product_id = cp.id
-                                  JOIN provinces prov ON pb.province_id = prov.id 
-                                  WHERE pb.id = ? AND pb.user_id = ?");
-            $stmt->execute([$buildingId, $userId]);
-            $b = $stmt->fetch(\PDO::FETCH_ASSOC);
-
-            if ($b) {
-                try {
-                    $db->beginTransaction();
-
-                    $category = strtolower(trim($b['category']));
-                    $regionMult = 1.0;
-                    if (str_contains($category, 'agri') || str_contains($category, 'tarım')) $regionMult = (float)$b['agri_multiplier'];
-                    elseif (str_contains($category, 'ind') || str_contains($category, 'sanayi')) $regionMult = (float)$b['ind_multiplier'];
-                    elseif (str_contains($category, 'mine') || str_contains($category, 'maden')) $regionMult = (float)$b['mine_multiplier'];
-                    if ($regionMult <= 0) $regionMult = 1.0;
-
-                    $health = (float)($b['condition_health'] ?? 100.0);
-                    $healthFactor = max(0, $health / 100.0);
-                    $baseProd = (int)$b['production_rate'];
-                    
-                    try {
-                        $matrixStmt = $db->prepare("SELECT production_rate FROM building_level_matrix WHERE building_type_id = ? AND level = ?");
-                        $matrixStmt->execute([$b['building_type_id'], (int)$b['level']]);
-                        $matrixRow = $matrixStmt->fetch(\PDO::FETCH_ASSOC);
-                        if ($matrixRow && isset($matrixRow['production_rate'])) {
-                            $baseProd = (int)$matrixRow['production_rate'];
-                        }
-                    } catch (\Exception $e) {}
-
-                    $prodAmount = round($baseProd * $regionMult * $healthFactor, 2);
-                    $unitCost = (float)($b['product_base_cost'] ?? 0);
-                    $totalProductionCost = round($prodAmount * $unitCost, 2);
-                    $finishCost = round($totalProductionCost * 0.20, 2);
-
-                    $consumesId = $b['consumes_product_id'];
-                    $consumptionAmount = (float)($b['consumption_amount'] ?? 0);
-                    if (!empty($consumesId) && $consumptionAmount > 0) {
-                        $chk = $db->prepare("SELECT quantity FROM user_inventories WHERE user_id = ? AND product_id = ?");
-                        $chk->execute([$userId, $consumesId]);
-                        $stockRow = $chk->fetch(\PDO::FETCH_ASSOC);
-                        $currentStock = (float)($stockRow['quantity'] ?? 0);
-                        if ($currentStock < $consumptionAmount) {
-                            throw new \Exception('Yetersiz Hammadde!');
-                        }
-                        $db->prepare("UPDATE user_inventories SET quantity = quantity - ? WHERE user_id = ? AND product_id = ?")
-                           ->execute([$consumptionAmount, $userId, $consumesId]);
-                    }
-
-                    $playerMoney = (float)$db->query("SELECT money FROM users WHERE id = {$userId}")->fetchColumn();
-                    if ($playerMoney < $finishCost) throw new \Exception('Yetersiz bütçe!');
-
-                    $pInfo = $db->prepare("SELECT warehouse_level FROM users WHERE id = ?");
-                    $pInfo->execute([$userId]);
-                    $wLevel = (int)($pInfo->fetchColumn() ?? 1);
-                    $slotLimit = $wLevel * 500.00;
-
-                    $producesId = $b['produces_product_id'];
-                    $invCheck = $db->prepare("SELECT quantity FROM user_inventories WHERE user_id = ? AND product_id = ?");
-                    $invCheck->execute([$userId, $producesId]);
-                    $invRow = $invCheck->fetch(\PDO::FETCH_ASSOC);
-                    $currentStock = (float)($invRow['quantity'] ?? 0);
-
-                    if (($currentStock + $prodAmount) > $slotLimit) {
-                        throw new \Exception('Depo Slot Kapasitesi Yetersiz!');
-                    }
-
-                    if ($finishCost > 0) {
-                        $db->prepare("UPDATE users SET money = money - ? WHERE id = ?")->execute([$finishCost, $userId]);
-                        $costLog = "{$prodAmount} adet {$b['product_name']} hızlı bitirmek için maliyet ({$finishCost}₺) ödendi.";
-                        $db->prepare("INSERT INTO building_logs (building_id, action_type, product_id, amount, description, created_at) VALUES (?, 'cost', ?, ?, ?, NOW())")
-                           ->execute([$buildingId, $producesId, $finishCost, $costLog]);
-                    }
-
-                    if (!empty($producesId) && $prodAmount > 0) {
-                        if ($invRow) {
-                            $db->prepare("UPDATE user_inventories SET quantity = quantity + ? WHERE user_id = ? AND product_id = ?")
-                               ->execute([$prodAmount, $userId, $producesId]);
-                        } else {
-                            $db->prepare("INSERT INTO user_inventories (user_id, product_id, quantity) VALUES (?, ?, ?)")
-                               ->execute([$userId, $producesId, $prodAmount]);
-                        }
-
-                        $logDesc = "[GOD MODE] {$prodAmount} adet {$b['product_name']} üretilip depoya eklendi.";
-                        $db->prepare("INSERT INTO building_logs (building_id, action_type, product_id, amount, description, created_at) VALUES (?, 'production', ?, ?, ?, NOW())")
-                           ->execute([$buildingId, $producesId, $prodAmount, $logDesc]);
-                    }
-
-                    $db->prepare("UPDATE user_buildings SET phase_started_at = NOW() WHERE id = ?")->execute([$buildingId]);
-                    $db->commit();
-                } catch (\Exception $e) {
-                    if ($db->inTransaction()) $db->rollBack();
-                }
-            }
-            redirect('/app/playerbuilding');
-        }
-    }
-
     public function store() {
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $db = Database::getInstance();
             $userId = $_SESSION['user_id'] ?? $_SESSION['id'] ?? 1;
-
             $buildingTypeId = (int)($_POST['building_id'] ?? $_POST['building_type_id'] ?? 0);
             $provinceId = (int)($_POST['province_id'] ?? 0);
 
@@ -707,12 +1073,10 @@ public function index() {
 
                 $db->beginTransaction();
                 $db->prepare("UPDATE users SET money = money - ? WHERE id = ?")->execute([$cost, $userId]);
-
                 $db->prepare("INSERT INTO user_buildings (user_id, building_type_id, province_id, level, condition_health, status, is_paused, production_status, phase_started_at, created_at) VALUES (?, ?, ?, 1, 100.0, 'active', 0, 'waiting_for_input', NOW(), NOW())")
                    ->execute([$userId, $buildingTypeId, $provinceId]);
-                
-                $db->commit();
 
+                $db->commit();
                 echo json_encode(['status' => 'success']);
                 exit;
             } catch (\Exception $e) {
@@ -768,7 +1132,6 @@ public function index() {
 
         if ($building) {
             $refundMoney = (float)($building['base_cost'] / 2);
-
             try {
                 $db->beginTransaction();
                 $db->prepare("UPDATE users SET money = money + ? WHERE id = ?")->execute([$refundMoney, $userId]);
