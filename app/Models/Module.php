@@ -59,9 +59,16 @@ class Module extends Model {
     }
 
     // Aktif Hiyerarşik Menüleri Getirir
-    public function getActiveHierarchicalMenus() {
+    // public function getActiveHierarchicalMenus() {
+    //     $db = $this->db();
+    //     $stmt = $db->query("SELECT * FROM {$this->table} WHERE status = 1 ORDER BY menu_order ASC");
+    //     $modules = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+        
+    //     return $this->buildTree($modules);
+    // }
+        public function getActiveHierarchicalMenus() {
         $db = $this->db();
-        $stmt = $db->query("SELECT * FROM {$this->table} WHERE status = 1 ORDER BY menu_order ASC");
+        $stmt = $db->query("SELECT * FROM {$this->table} WHERE status = 1 AND (url LIKE 'admin/%') ORDER BY menu_order ASC");
         $modules = $stmt->fetchAll(\PDO::FETCH_ASSOC);
         
         return $this->buildTree($modules);

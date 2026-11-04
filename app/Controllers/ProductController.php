@@ -11,22 +11,21 @@ class ProductController extends Controller {
     public function index() {
         $db = Database::getInstance();
         
-        // Ürünleri ve varsa reçete detaylarını çekelim
-        $products = $db->query("SELECT p.*, pr.id as recipe_id, pr.output_quantity 
+        $products = $db->query("SELECT p.*, bo.building_type_id, bo.amount as output_amount, bo.production_rate, bt.name as building_type_name 
                                 FROM products p 
-                                LEFT JOIN product_recipes pr ON p.id = pr.product_id 
+                                LEFT JOIN building_outputs bo ON p.id = bo.product_id 
+                                LEFT JOIN building_types bt ON bo.building_type_id = bt.id 
                                 ORDER BY p.id DESC")->fetchAll(\PDO::FETCH_ASSOC);
 
-        // Her ürünün reçete girdilerini (maddelerini) ekleyelim
         foreach ($products as &$product) {
-            $product['recipe_items'] = [];
-            if ($product['recipe_id']) {
-                $itemStmt = $db->prepare("SELECT pri.*, prod.name as item_name, prod.type as item_type 
-                                          FROM product_recipe_items pri 
-                                          JOIN products prod ON pri.product_id = prod.id 
-                                          WHERE pri.product_recipe_id = ?");
-                $itemStmt->execute([$product['recipe_id']]);
-                $product['recipe_items'] = $itemStmt->fetchAll(\PDO::FETCH_ASSOC);
+            $product['inputs'] = [];
+            if (!empty($product['building_type_id'])) {
+                $inputStmt = $db->prepare("SELECT bi.*, p.name as input_product_name, p.type as input_product_type 
+                                          FROM building_inputs bi 
+                                          JOIN products p ON bi.product_id = p.id 
+                                          WHERE bi.building_type_id = ?");
+                $inputStmt->execute([$product['building_type_id']]);
+                $product['inputs'] = $inputStmt->fetchAll(\PDO::FETCH_ASSOC);
             }
         }
 
@@ -35,25 +34,34 @@ class ProductController extends Controller {
 
     public function create() {
         $db = Database::getInstance();
-        // Reçeteye girdi seçebilmek için sistemdeki tüm ürünleri çekelim
         $allProducts = $db->query("SELECT * FROM products ORDER BY name ASC")->fetchAll(\PDO::FETCH_ASSOC);
+        $buildingTypes = $db->query("SELECT * FROM building_types ORDER BY name ASC")->fetchAll(\PDO::FETCH_ASSOC);
 
-        $this->adminView('admin/products/create', ['allProducts' => $allProducts]);
+        $this->adminView('admin/products/create', [
+            'allProducts' => $allProducts,
+            $buildingTypesKey = 'buildingTypes' => $buildingTypes
+        ]);
     }
 
     public function store() {
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $db = Database::getInstance();
 
-            $name       = trim($_POST['name'] ?? '');
-            $type       = trim($_POST['type'] ?? 'raw');
-            $basePrice  = (float)($_POST['base_price'] ?? 10.00);
-            $outputQty  = (int)($_POST['output_quantity'] ?? 1);
-            $recipeItems = $_POST['recipe_items'] ?? []; // [product_id => quantity]
+            $name           = trim($_POST['name'] ?? '');
+            $type           = trim($_POST['type'] ?? 'raw');
+            $basePrice      = (float)($_POST['base_price'] ?? 10.00);
+            $unitCost       = (float)($_POST['unit_cost'] ?? 100.00);
+            $prodSec        = (int)($_POST['production_seconds'] ?? 600); 
+            $unitType       = trim($_POST['unit_type'] ?? 'Adet');
+            $buildingTypeId = !empty($_POST['building_type_id']) ? (int)$_POST['building_type_id'] : null;
+            
+            // BİRLEŞTİRİLEN ALAN: Döngü Başı Miktar (amount) ve Rate
+            $outputAmount   = (float)($_POST['output_amount'] ?? 1.0);
+            $productionRate = (float)($_POST['production_rate'] ?? 1.0);
+            $inputsData     = $_POST['building_inputs'] ?? [];
 
             $imageName = 'default.png';
 
-            // Görsel Yükleme
             if (isset($_FILES['image']) && $_FILES['image']['error'] === UPLOAD_ERR_OK) {
                 if (!is_dir($this->uploadDir)) {
                     mkdir($this->uploadDir, 0755, true);
@@ -75,21 +83,24 @@ class ProductController extends Controller {
             try {
                 $db->beginTransaction();
 
-                // 1. Ürünü Kaydet
-                $stmt = $db->prepare("INSERT INTO products (name, type, base_price, image) VALUES (?, ?, ?, ?)");
-                $stmt->execute([$name, $type, $basePrice, $imageName]);
+                $stmt = $db->prepare("INSERT INTO products (name, type, base_price, unit_cost, production_seconds, unit_type, image) VALUES (?, ?, ?, ?, ?, ?, ?)");
+                $stmt->execute([$name, $type, $basePrice, $unitCost, $prodSec, $unitType, $imageName]);
                 $productId = $db->lastInsertId();
 
-                // 2. Eğer ürün hammaddeden farklıysa ve girdileri varsa reçete oluştur
-                if ($type !== 'raw' && !empty($recipeItems)) {
-                    $recipeStmt = $db->prepare("INSERT INTO product_recipes (product_id, output_quantity) VALUES (?, ?)");
-                    $recipeStmt->execute([$productId, $outputQty]);
-                    $recipeId = $db->lastInsertId();
+                if ($buildingTypeId) {
+                    $db->prepare("DELETE FROM building_outputs WHERE building_type_id = ?")->execute([$buildingTypeId]);
+                    
+                    $outStmt = $db->prepare("INSERT INTO building_outputs (building_type_id, product_id, amount, production_rate) VALUES (?, ?, ?, ?)");
+                    $outStmt->execute([$buildingTypeId, $productId, $outputAmount, $productionRate]);
 
-                    $itemStmt = $db->prepare("INSERT INTO product_recipe_items (product_recipe_id, product_id, quantity_required) VALUES (?, ?, ?)");
-                    foreach ($recipeItems as $reqProductId => $qty) {
-                        if ((int)$qty > 0) {
-                            $itemStmt->execute([$recipeId, (int)$reqProductId, (int)$qty]);
+                    $db->prepare("DELETE FROM building_inputs WHERE building_type_id = ?")->execute([$buildingTypeId]);
+                    
+                    if (!empty($inputsData)) {
+                        $inStmt = $db->prepare("INSERT INTO building_inputs (building_type_id, product_id, amount) VALUES (?, ?, ?)");
+                        foreach ($inputsData as $reqProductId => $reqAmount) {
+                            if ((float)$reqAmount > 0) {
+                                $inStmt->execute([$buildingTypeId, (int)$reqProductId, (float)$reqAmount]);
+                            }
                         }
                     }
                 }
@@ -97,6 +108,7 @@ class ProductController extends Controller {
                 $db->commit();
             } catch (\Exception $e) {
                 $db->rollBack();
+                error_log("Ürün Ekleme Hatası: " . $e->getMessage());
             }
 
             redirect('admin/product');
@@ -115,27 +127,35 @@ class ProductController extends Controller {
             redirect('admin/product');
         }
 
-        // Ürünün mevcut reçetesini çek
-        $recipeStmt = $db->prepare("SELECT * FROM product_recipes WHERE product_id = ?");
-        $recipeStmt->execute([$productId]);
-        $recipe = $recipeStmt->fetch(\PDO::FETCH_ASSOC);
+        $outStmt = $db->prepare("SELECT * FROM building_outputs WHERE product_id = ?");
+        $outStmt->execute([$productId]);
+        $buildingOutput = $outStmt->fetch(\PDO::FETCH_ASSOC);
 
-        $recipeItemsMap = [];
-        if ($recipe) {
-            $itemsStmt = $db->prepare("SELECT product_id, quantity_required FROM product_recipe_items WHERE product_recipe_id = ?");
-            $itemsStmt->execute([$recipe['id']]);
-            foreach ($itemsStmt->fetchAll(\PDO::FETCH_ASSOC) as $item) {
-                $recipeItemsMap[$item['product_id']] = $item['quantity_required'];
+        $buildingInputsMap = [];
+        $assignedBuildingTypeId = $buildingOutput['building_type_id'] ?? null;
+        $outputAmount = $buildingOutput['amount'] ?? 1.00;
+        $baseProductionRate = isset($buildingOutput['production_rate']) ? (float)$buildingOutput['production_rate'] : 1.0;
+
+        if ($assignedBuildingTypeId) {
+            $inStmt = $db->prepare("SELECT product_id, amount FROM building_inputs WHERE building_type_id = ?");
+            $inStmt->execute([$assignedBuildingTypeId]);
+            foreach ($inStmt->fetchAll(\PDO::FETCH_ASSOC) as $input) {
+                $buildingInputsMap[$input['product_id']] = (float)$input['amount'];
             }
         }
 
         $allProducts = $db->query("SELECT * FROM products ORDER BY name ASC")->fetchAll(\PDO::FETCH_ASSOC);
+        $buildingTypes = $db->query("SELECT * FROM building_types ORDER BY name ASC")->fetchAll(\PDO::FETCH_ASSOC);
 
         $this->adminView('admin/products/edit', [
             'product' => $product,
-            'recipe' => $recipe,
-            'recipeItemsMap' => $recipeItemsMap,
-            'allProducts' => $allProducts
+            'buildingOutput' => $buildingOutput,
+            'outputAmount' => $outputAmount,
+            'baseProductionRate' => $baseProductionRate,
+            'assignedBuildingTypeId' => $assignedBuildingTypeId,
+            'buildingInputsMap' => $buildingInputsMap,
+            'allProducts' => $allProducts,
+            'buildingTypes' => $buildingTypes
         ]);
     }
 
@@ -144,19 +164,23 @@ class ProductController extends Controller {
             $db = Database::getInstance();
             $productId = (int)$id;
 
-            $name       = trim($_POST['name'] ?? '');
-            $type       = trim($_POST['type'] ?? 'raw');
-            $basePrice  = (float)($_POST['base_price'] ?? 10.00);
-            $outputQty  = (int)($_POST['output_quantity'] ?? 1);
-            $recipeItems = $_POST['recipe_items'] ?? [];
+            $name           = trim($_POST['name'] ?? '');
+            $type           = trim($_POST['type'] ?? 'raw');
+            $basePrice      = (float)($_POST['base_price'] ?? 10.00);
+            $unitCost       = (float)($_POST['unit_cost'] ?? 100.00);
+            $prodSec        = (int)($_POST['production_seconds'] ?? 600); 
+            $unitType       = trim($_POST['unit_type'] ?? 'Adet');
+            $buildingTypeId = !empty($_POST['building_type_id']) ? (int)$_POST['building_type_id'] : null;
+            
+            $outputAmount   = (float)($_POST['output_amount'] ?? 1.0);
+            $productionRate = (float)($_POST['production_rate'] ?? 1.0);
+            $inputsData     = $_POST['building_inputs'] ?? [];
 
-            // Eski görseli bul
             $stmtOld = $db->prepare("SELECT image FROM products WHERE id = ?");
             $stmtOld->execute([$productId]);
             $oldProduct = $stmtOld->fetch(\PDO::FETCH_ASSOC);
             $imageName = $oldProduct['image'] ?? 'default.png';
 
-            // Yeni görsel yüklendiyse
             if (isset($_FILES['image']) && $_FILES['image']['error'] === UPLOAD_ERR_OK) {
                 if (!is_dir($this->uploadDir)) {
                     mkdir($this->uploadDir, 0755, true);
@@ -181,39 +205,25 @@ class ProductController extends Controller {
             try {
                 $db->beginTransaction();
 
-                // 1. Ürünü Güncelle
-                $stmt = $db->prepare("UPDATE products SET name = ?, type = ?, base_price = ?, image = ? WHERE id = ?");
-                $stmt->execute([$name, $type, $basePrice, $imageName, $productId]);
+                $stmt = $db->prepare("UPDATE products SET name = ?, type = ?, base_price = ?, unit_cost = ?, production_seconds = ?, unit_type = ?, image = ? WHERE id = ?");
+                $stmt->execute([$name, $type, $basePrice, $unitCost, $prodSec, $unitType, $imageName, $productId]);
 
-                // 2. Reçete İşlemleri
-                // Önce mevcut reçeteyi bulalım
-                $recipeStmt = $db->prepare("SELECT id FROM product_recipes WHERE product_id = ?");
-                $recipeStmt->execute([$productId]);
-                $recipe = $recipeStmt->fetch(\PDO::FETCH_ASSOC);
+                $db->prepare("DELETE FROM building_outputs WHERE product_id = ?")->execute([$productId]);
 
-                if ($type === 'raw' || $type === 'utility') {
-                    // Hammadde veya utility olduysa ve eski reçetesi varsa tamamen sil
-                    if ($recipe) {
-                        $db->prepare("DELETE FROM product_recipes WHERE id = ?")->execute([$recipe['id']]);
-                    }
-                } else {
-                    // Semi veya Finished ise reçeteyi güncelle/oluştur
-                    if ($recipe) {
-                        $recipeId = $recipe['id'];
-                        $db->prepare("UPDATE product_recipes SET output_quantity = ? WHERE id = ?")->execute([$outputQty, $recipeId]);
-                        // Eski girdileri temizle
-                        $db->prepare("DELETE FROM product_recipe_items WHERE product_recipe_id = ?")->execute([$recipeId]);
-                    } else {
-                        $insRecipe = $db->prepare("INSERT INTO product_recipes (product_id, output_quantity) VALUES (?, ?)");
-                        $insRecipe->execute([$productId, $outputQty]);
-                        $recipeId = $db->lastInsertId();
-                    }
+                if ($buildingTypeId) {
+                    $db->prepare("DELETE FROM building_outputs WHERE building_type_id = ?")->execute([$buildingTypeId]);
 
-                    // Yeni girdileri ekle
-                    $itemStmt = $db->prepare("INSERT INTO product_recipe_items (product_recipe_id, product_id, quantity_required) VALUES (?, ?, ?)");
-                    foreach ($recipeItems as $reqProductId => $qty) {
-                        if ((int)$qty > 0 && (int)$reqProductId !== $productId) {
-                            $itemStmt->execute([$recipeId, (int)$reqProductId, (int)$qty]);
+                    $outStmt = $db->prepare("INSERT INTO building_outputs (building_type_id, product_id, amount, production_rate) VALUES (?, ?, ?, ?)");
+                    $outStmt->execute([$buildingTypeId, $productId, $outputAmount, $productionRate]);
+
+                    $db->prepare("DELETE FROM building_inputs WHERE building_type_id = ?")->execute([$buildingTypeId]);
+
+                    if (!empty($inputsData)) {
+                        $inStmt = $db->prepare("INSERT INTO building_inputs (building_type_id, product_id, amount) VALUES (?, ?, ?)");
+                        foreach ($inputsData as $reqProductId => $reqAmount) {
+                            if ((float)$reqAmount > 0) {
+                                $inStmt->execute([$buildingTypeId, (int)$reqProductId, (float)$reqAmount]);
+                            }
                         }
                     }
                 }
@@ -221,6 +231,7 @@ class ProductController extends Controller {
                 $db->commit();
             } catch (\Exception $e) {
                 $db->rollBack();
+                error_log("Ürün Güncelleme Hatası: " . $e->getMessage());
             }
 
             redirect('admin/product');
@@ -242,7 +253,9 @@ class ProductController extends Controller {
             }
         }
 
+        $db->prepare("DELETE FROM building_outputs WHERE product_id = ?")->execute([$productId]);
         $db->prepare("DELETE FROM products WHERE id = ?")->execute([$productId]);
+
         redirect('admin/product');
     }
 }
