@@ -33,7 +33,7 @@
                         </div>
                     </div>
                 </div>
-
+ 
                 <hr class="my-4">
 
                 <label class="form-label fw-bold text-secondary mb-3"><i class="fas fa-boxes me-1"></i> Bu Binanın Tükettiği Hammaddeler (Building Inputs)</label>
